@@ -59,15 +59,6 @@ int gbl_sc_last_writer_time = 0;
 
 /* updates/deletes done behind the cursor since schema change started */
 pthread_mutex_t gbl_sc_lock = PTHREAD_MUTEX_INITIALIZER;
-/* boolean value set to nonzero if table rebuild is in progress */
-int doing_conversion = 0;
-/* boolean value set to nonzero if table upgrade is in progress */
-int doing_upgrade = 0;
-unsigned gbl_sc_adds;
-unsigned gbl_sc_updates;
-unsigned gbl_sc_deletes;
-long long gbl_sc_nrecs;
-long long gbl_sc_prev_nrecs; /* nrecs since last report */
 int gbl_sc_report_freq = 15; /* seconds between reports */
 int gbl_sc_abort = 0;
 int gbl_sc_resume_start = 0;
@@ -124,24 +115,42 @@ const char *get_sc_to_name(const char *name)
 void wait_for_sc_to_stop(void)
 {
     stopsc = 1;
+    logmsg(LOGMSG_INFO, "%s: set stopsc\n", __func__);
     if (gbl_schema_change_in_progress) {
         logmsg(LOGMSG_INFO, "giving schemachange time to stop\n");
-        int retry = 10;
-        while (gbl_schema_change_in_progress && retry--) {
+        int waited = 0;
+        while (gbl_schema_change_in_progress) {
             sleep(1);
+            waited++;
+            if (waited > 10)
+                logmsg(LOGMSG_ERROR,
+                       "downgrade waiting schema changes to stop for: %ds\n",
+                       waited);
+            if (waited > 60) {
+                logmsg(LOGMSG_FATAL,
+                       "schema changes take too long to stop, waited %ds\n",
+                       waited);
+                abort();
+            }
         }
         logmsg(LOGMSG_INFO, "proceeding with downgrade (waited for: %ds)\n",
-               10 - retry);
+               waited);
+    }
+    extern int gbl_test_sc_resume_race;
+    if (gbl_test_sc_resume_race) {
+        logmsg(LOGMSG_INFO, "%s: sleeping 5s to test\n", __func__);
+        sleep(5);
     }
 }
 
 void allow_sc_to_run(void)
 {
     stopsc = 0;
+    logmsg(LOGMSG_INFO, "%s: allow sc to run\n", __func__);
 }
 
 typedef struct {
-    char *table;
+    char *tablename;
     uint64_t seed;
     uint32_t host; /* crc32 of machine name */
     time_t time;
@@ -169,14 +178,14 @@ int sc_set_running(char *table, int running, uint64_t seed, const char *host,
     printf("%s: %d\n", __func__, running);
     comdb2_linux_cheap_stack_trace();
 #endif
+    pthread_mutex_lock(&schema_change_in_progress_mutex);
     if (sc_tables == NULL) {
         sc_tables =
             hash_init_user((hashfunc_t *)strhashfunc, (cmpfunc_t *)strcmpfunc,
-                           offsetof(sc_table_t, table), 0);
+                           offsetof(sc_table_t, tablename), 0);
     }
     assert(sc_tables);
 
-    pthread_mutex_lock(&schema_change_in_progress_mutex);
     if (thedb->master == gbl_mynode) {
         if (running && table &&
             (sctbl = hash_find_readonly(sc_tables, &table)) != NULL &&
@@ -197,13 +206,15 @@ int sc_set_running(char *table, int running, uint64_t seed, const char *host,
     }
     if (running) {
         /* this is an osql replay of a resuming schema change */
-        if (sctbl)
+        if (sctbl) {
+            pthread_mutex_unlock(&schema_change_in_progress_mutex);
             return 0;
+        }
         if (table) {
             sctbl = calloc(1, offsetof(sc_table_t, mem) + strlen(table) + 1);
             assert(sctbl);
             strcpy(sctbl->mem, table);
-            sctbl->table = sctbl->mem;
+            sctbl->tablename = sctbl->mem;
 
             sctbl->seed = seed;
             sctbl->host = host ? crc32c((uint8_t *)host, strlen(host)) : 0;
@@ -249,27 +260,29 @@ void sc_status(struct dbenv *dbenv)
     if (sc_tables)
         sctbl = hash_first(sc_tables, &ent, &bkt);
     while (gbl_schema_change_in_progress && sctbl) {
-        const char *mach;
-        time_t timet;
-        getMachineAndTimeFromFstSeed(sctbl->seed, sctbl->host, &mach, &timet);
+        const char *mach = get_hostname_with_crc32(thedb->bdb_env, sctbl->host);
+        time_t timet = sctbl->time;
         struct tm tm;
         localtime_r(&timet, &tm);
 
         logmsg(LOGMSG_USER, "-------------------------\n");
-        logmsg(LOGMSG_USER, "Schema change in progress with seed 0x%lx\n",
-               sctbl->seed);
         logmsg(LOGMSG_USER,
-               "(Started on node %s at %04d-%02d-%02d %02d:%02d:%02d) for "
-               "table %s\n",
+               "Schema change in progress for table %s "
+               "with seed 0x%lx\n",
+               sctbl->tablename, sctbl->seed);
+        logmsg(LOGMSG_USER,
+               "(Started on node %s at %04d-%02d-%02d %02d:%02d:%02d)\n",
                mach ? mach : "(unknown)", tm.tm_year + 1900, tm.tm_mon + 1,
-               tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, sctbl->table);
-        if (doing_conversion) {
+               tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        struct dbtable *db = get_dbtable_by_name(sctbl->tablename);
+
+        if (db && db->doing_conversion)
             logmsg(LOGMSG_USER, "Conversion phase running %lld converted\n",
-                   gbl_sc_nrecs);
-        } else if (doing_upgrade) {
+                   db->sc_nrecs);
+        else if (db && db->doing_upgrade)
             logmsg(LOGMSG_USER, "Upgrade phase running %lld upgraded\n",
-                   gbl_sc_nrecs);
-        }
+                   db->sc_nrecs);
+
         logmsg(LOGMSG_USER, "-------------------------\n");
         sctbl = hash_next(sc_tables, &ent, &bkt);
     }
@@ -281,11 +294,6 @@ void sc_status(struct dbenv *dbenv)
 
 void reset_sc_stat()
 {
-    gbl_sc_adds = 0;
-    gbl_sc_updates = 0;
-    gbl_sc_deletes = 0;
-    gbl_sc_nrecs = 0;
-    gbl_sc_prev_nrecs = 0;
     gbl_sc_abort = 0;
 }
 /* Turn off live schema change.  This HAS to be done while holding the exclusive
@@ -297,6 +305,12 @@ void live_sc_off(struct dbtable *db)
     db->sc_to = NULL;
     db->sc_from = NULL;
     db->sc_abort = 0;
+    db->sc_downgrading = 0;
+    db->sc_adds = 0;
+    db->sc_updates = 0;
+    db->sc_deletes = 0;
+    db->sc_nrecs = 0;
+    db->sc_prev_nrecs = 0;
     pthread_rwlock_unlock(&sc_live_rwlock);
 }
 
@@ -311,5 +325,37 @@ int replicant_reload_analyze_stats()
 {
     ATOMIC_ADD(gbl_analyze_gen, 1);
     logmsg(LOGMSG_DEBUG, "Replicant invalidating SQLite stats\n");
+    return 0;
+}
+
+int is_table_in_schema_change(const char *tbname, tran_type *tran)
+{
+    int bdberr;
+    void *packed_sc_data = NULL;
+    size_t packed_sc_data_len;
+    int rc = 0;
+    rc = bdb_get_in_schema_change(tran, tbname, &packed_sc_data,
+                                  &packed_sc_data_len, &bdberr);
+    if (rc || bdberr != BDBERR_NOERROR) {
+        logmsg(LOGMSG_ERROR, "%s: failed to read llmeta\n", __func__);
+        return -1;
+    }
+    if (packed_sc_data) {
+        struct schema_change_type *s = new_schemachange_type();
+        if (s == NULL) {
+            logmsg(LOGMSG_ERROR, "%s: out of memory\n", __func__);
+            return -1;
+        }
+        rc = unpack_schema_change_type(s, packed_sc_data, packed_sc_data_len);
+        if (rc) {
+            logmsg(LOGMSG_ERROR, "%s: failed to unpack schema change\n",
+                   __func__);
+            return -1;
+        }
+        rc = (strcasecmp(tbname, s->table) == 0);
+        free(packed_sc_data);
+        free_schema_change_type(s);
+        return rc;
+    }
     return 0;
 }

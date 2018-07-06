@@ -151,6 +151,7 @@ void *memp_trickle_thread(void *arg)
 
     bdb_thread_event(bdb_state, 0);
     logmsg(LOGMSG_DEBUG, "memp_trickle_thread: exiting\n");
+    return NULL;
 }
 
 void *deadlockdetect_thread(void *arg)
@@ -343,8 +344,6 @@ void *logdelete_thread(void *arg)
 
     while (!bdb_state->after_llmeta_init_done)
         sleep(1);
-
-    populate_deleted_files(bdb_state);
 
     thread_started("bdb logdelete");
 

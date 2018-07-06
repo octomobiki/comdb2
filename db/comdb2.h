@@ -37,20 +37,6 @@
 
 enum { IOTIMEOUTMS = 10000 };
 
-enum {
-    SQLF_QUEUE_ME = 1,
-    SQLF_FAILDISPATCH_ON = 2,
-    SQLF_CONVERTED_BLOSQL = 4,
-    SQLREQ_FLAG_WANT_SP_TRACE = 8,
-    SQLREQ_FLAG_WANT_SP_DEBUG = 16,
-    SQLF_WANT_NEW_ROW_DATA = 32,
-    SQLF_WANT_QUERY_EFFECTS = 64,
-    SQLF_WANT_READONLY_ACCESS = 128,
-    SQLF_WANT_VERIFYRETRY_OFF = 256
-};
-
-#define N_BBIPC 2
-
 struct dbtable;
 struct consumer;
 struct thr_handle;
@@ -94,7 +80,6 @@ typedef long long tranid_t;
 #include "tag.h"
 #include "errstat.h"
 #include "comdb2_rcodes.h"
-#include "sqlquery.pb-c.h"
 #include "repl_wait.h"
 #include "types.h"
 #include "thread_util.h"
@@ -713,7 +698,7 @@ struct dbtable {
     unsigned prev_blocktypcnt[BLOCK_MAXOPCODE];
     unsigned prev_blockosqltypcnt[MAX_OSQL_TYPES];
     unsigned prev_nsql;
-    /* counters for autoanalyze */
+    /* counters for writes to this table */
     unsigned write_count[RECORD_WRITE_MAX];
     unsigned saved_write_count[RECORD_WRITE_MAX];
     unsigned aa_saved_counter; // zeroed out at autoanalyze
@@ -778,7 +763,23 @@ struct dbtable {
     struct dbtable *sc_from; /* point to the source db, replace global sc_from */
     struct dbtable *sc_to; /* point to the new db, replace global sc_to */
     int sc_abort;
+    int sc_downgrading;
     unsigned long long *sc_genids; /* schemachange stripe pointers */
+
+    /* count the number of updates and deletes done by schemachange
+     * when behind the cursor.  This helps us know how many
+     * records we've really done (since every update behind the cursor
+     * effectively means we have to go back and do that record again). */
+    unsigned sc_adds;
+    unsigned sc_deletes;
+    unsigned sc_updates;
+
+    uint64_t sc_nrecs;
+    uint64_t sc_prev_nrecs;
+    /* boolean value set to nonzero if table rebuild is in progress */
+    uint8_t doing_conversion;
+    /* boolean value set to nonzero if table upgrade is in progress */
+    uint8_t doing_upgrade;
 
     unsigned int sqlcur_ix;  /* count how many cursors where open in ix mode */
     unsigned int sqlcur_cur; /* count how many cursors where open in cur mode */
@@ -837,7 +838,7 @@ struct dbenv {
     void *bdb_callback; /*engine callbacks */
 
     char *master; /*current master node, from callback*/
-    int egen;     /*election generation for current master node*/
+    int gen;      /*election generation for current master node*/
 
     int cacheszkb;
     int cacheszkbmin;
@@ -1030,14 +1031,13 @@ typedef struct {
 typedef struct sorese_info {
     unsigned long long rqid; /* not null means active */
     uuid_t uuid;
-    char *host; /* sql machine, 0 is local */
+    const char *host; /* sql machine, 0 is local */
     SBUF2 *osqllog; /* used to track sorese requests */
     int type;   /* type, socksql or recom */
     int nops;   /* if no error, how many updated rows were performed */
     int rcout;  /* store here the block proc main error */
 
     int verify_retries; /* how many times we verify retried this one */
-    bool use_blkseq;    /* used to force a blkseq, for locally retried txn */
     bool osql_retry;    /* if this is osql transaction, once sql part
                           finished successful, we set this to one
                           to avoid repeating it if the transaction is reexecuted
@@ -1331,6 +1331,8 @@ struct ireq {
     /* osql prefault step index */
     int *osql_step_ix;
 
+    tran_type *sc_logical_tran;
+    tran_type *sc_tran;
     struct schema_change_type *sc_pending;
     double cost;
     uint64_t sc_seed;
@@ -1346,14 +1348,6 @@ struct ireq {
 
     /* more stats - number of retries done under this request */
     int retries;
-
-    /* count the number of updates and deletes done by this transaction in
-     * a live schema change behind the cursor.  This helps us know how many
-     * records we've really done (since every update behind the cursor
-     * effectively means we have to go back and do that record again). */
-    unsigned sc_adds;
-    unsigned sc_deletes;
-    unsigned sc_updates;
 
     int ixused;    /* what index was used? */
     int ixstepcnt; /* how many steps on that index? */
@@ -1628,11 +1622,6 @@ extern int gbl_init_single_meta;
 extern unsigned long long gbl_sc_genids[MAXDTASTRIPE];
 extern int gbl_sc_usleep;
 extern int gbl_sc_wrusleep;
-extern unsigned gbl_sc_adds;
-extern unsigned gbl_sc_updates;
-extern unsigned gbl_sc_deletes;
-extern long long gbl_sc_nrecs;
-extern long long gbl_sc_prev_nrecs;
 extern int gbl_sc_last_writer_time;
 extern int gbl_default_livesc;
 extern int gbl_default_plannedsc;
@@ -1822,8 +1811,6 @@ enum comdb2_queue_types {
     REQ_PQREQUEST
 };
 
-int convert_client_ftype(int type);
-
 int handle_buf(struct dbenv *dbenv, uint8_t *p_buf, const uint8_t *p_buf_end,
                int debug, char *frommach); /* 040307dh: 64bits */
 int handle_buf_offload(struct dbenv *dbenv, uint8_t *p_buf,
@@ -1875,7 +1862,6 @@ void reqdumphex(struct ireq *iq, void *buf,
 void reqprintflush(struct ireq *iq); /* flush current line */
 void reqpushprefixf(struct ireq *iq, const char *format, ...);
 void reqpopprefixes(struct ireq *iq, int num);
-void hexdumpdta(unsigned char *p, int len);
 const char *req2a(int opcode);
 void reqerrstr(struct ireq *iq, int rc, char *format, ...);
 void reqerrstrhdr(struct ireq *iq, char *format,
@@ -1963,9 +1949,10 @@ int rowlocks_check_commit_physical(bdb_state_type *, tran_type *,
                                    int blockop_count);
 tran_type *trans_start_readcommitted(struct ireq *, int trak);
 tran_type *trans_start_serializable(struct ireq *, int trak, int epoch,
-                                    int file, int offset, int *error);
+                                    int file, int offset, int *error,
+                                    int is_ha_retry);
 tran_type *trans_start_snapisol(struct ireq *, int trak, int epoch, int file,
-                                int offset, int *error);
+                                int offset, int *error, int is_ha_retry);
 tran_type *trans_start_socksql(struct ireq *, int trak);
 int trans_commit(struct ireq *iq, void *trans, char *source_host);
 int trans_commit_seqnum(struct ireq *iq, void *trans, db_seqnum_type *seqnum);
@@ -1991,18 +1978,19 @@ int load_record(struct dbtable *db, void *buf);
 void load_data_done(struct dbtable *db);
 
 /*index routines*/
+int ix_isnullk(void *db_table, void *key, int ixnum);
 int ix_addk(struct ireq *iq, void *trans, void *key, int ixnum,
-            unsigned long long genid, int rrn, void *dta, int dtalen);
+            unsigned long long genid, int rrn, void *dta, int dtalen, int isnull);
 int ix_addk_auxdb(int auxdb, struct ireq *iq, void *trans, void *key, int ixnum,
-                  unsigned long long genid, int rrn, void *dta, int dtalen);
+                  unsigned long long genid, int rrn, void *dta, int dtalen, int isnull);
 int ix_upd_key(struct ireq *iq, void *trans, void *key, int keylen, int ixnum,
                unsigned long long genid, unsigned long long oldgenid, void *dta,
-               int dtalen);
+               int dtalen, int isnull);
 
 int ix_delk(struct ireq *iq, void *trans, void *key, int ixnum, int rrn,
-            unsigned long long genid);
+            unsigned long long genid, int isnull);
 int ix_delk_auxdb(int auxdb, struct ireq *iq, void *trans, void *key, int ixnum,
-                  int rrn, unsigned long long genid);
+                  int rrn, unsigned long long genid, int isnull);
 
 enum {
     IX_FIND_IGNORE_INCOHERENT = 1
@@ -2308,6 +2296,7 @@ void stop_threads(struct dbenv *env);
 void resume_threads(struct dbenv *env);
 void replace_db_idx(struct dbtable *p_db, int idx);
 int reload_schema(char *table, const char *csc2, tran_type *tran);
+int add_db(struct dbtable *db);
 void delete_db(char *db_name);
 int rename_db(struct dbtable *db, const char *newname);
 int ix_find_rnum_by_recnum(struct ireq *iq, int recnum_in, int ixnum,
@@ -2462,13 +2451,17 @@ int create_sqlmaster_records(void *tran);
 void form_new_style_name(char *namebuf, int len, struct schema *schema,
                          const char *csctag, const char *dbname);
 
+typedef struct master_entry master_entry_t;
+int get_copy_rootpages_custom(struct sql_thread *thd, master_entry_t *ents,
+                              int nents);
 int get_copy_rootpages_nolock(struct sql_thread *thd);
 int get_copy_rootpages(struct sql_thread *thd);
+master_entry_t *create_master_entry_array(struct dbtable **dbs, int num_dbs,
+                                          int *nents);
 void cleanup_sqlite_master();
-int create_sqlite_master();
-typedef struct master_entry master_entry_t;
+void create_sqlite_master();
 int destroy_sqlite_master(master_entry_t *, int);
-int new_indexes_syntax_check(struct ireq *iq);
+int new_indexes_syntax_check(struct ireq *iq, struct dbtable *db);
 void handle_isql(struct dbtable *db, SBUF2 *sb);
 void handle_timesql(SBUF2 *sb, struct dbtable *db);
 int handle_sql(SBUF2 *sb);
@@ -2577,6 +2570,7 @@ char *getdbrelpath(const char *relpath);
 void addresource(const char *name, const char *filepath);
 const char *getresourcepath(const char *name);
 void dumpresources(void);
+void cleanresources(void);
 
 /* for the hackery that gets findnext passing "lastgenid" */
 void split_genid(unsigned long long genid, unsigned int *rrn1,
@@ -2734,6 +2728,8 @@ struct sqlclntstate;
 int initialize_shadow_trans(struct sqlclntstate *, struct sql_thread *thd);
 void get_current_lsn(struct sqlclntstate *clnt);
 void done_sql_thread(void);
+int sql_debug_logf(struct sqlclntstate *clnt, const char *func, int line,
+                   const char *fmt, ...);
 
 enum { LOG_DEL_ABS_ON, LOG_DEL_ABS_OFF, LOG_DEL_REFRESH };
 void log_delete_counter_change(struct dbenv *dbenv, int action);
@@ -2757,7 +2753,8 @@ void no_new_requests(struct dbenv *dbenv);
 int get_next_seqno(void *tran, long long *seqno);
 int add_oplog_entry(struct ireq *iq, void *trans, int type, void *logrec,
                     int logsz);
-int local_replicant_write_clear(struct dbtable *db);
+int local_replicant_write_clear(struct ireq *in_iq, void *in_trans,
+                                struct dbtable *db);
 long long get_record_unique_id(struct dbtable *db, void *rec);
 void cancel_sql_statement(int id);
 void cancel_sql_statement_with_cnonce(const char *cnonce);
@@ -2815,13 +2812,13 @@ void reqlog_set_vreplays(struct reqlogger *logger, int replays);
 void reqlog_set_queue_time(struct reqlogger *logger, uint64_t timeus);
 void reqlog_set_fingerprint(struct reqlogger *logger, const char *fp, size_t n);
 void reqlog_set_rqid(struct reqlogger *logger, void *id, int idlen);
-void reqlog_set_request(struct reqlogger *logger, CDB2SQLQUERY *q);
 void reqlog_set_event(struct reqlogger *logger, const char *evtype);
 void reqlog_add_table(struct reqlogger *logger, const char *table);
 void reqlog_set_error(struct reqlogger *logger, const char *error,
                       int error_code);
 void reqlog_set_path(struct reqlogger *logger, struct client_query_stats *path);
 void reqlog_set_context(struct reqlogger *logger, int ncontext, char **context);
+void reqlog_set_clnt(struct reqlogger *, struct sqlclntstate *);
 /* Convert raw fingerprint to hex string, and write at most `n' characters of
    the result to `hexstr'. Return the number of characters written. */
 int reqlog_fingerprint_to_hex(struct reqlogger *logger, char *hexstr, size_t n);
@@ -3230,11 +3227,6 @@ extern unsigned long long gbl_inplace_blob_cnt;
 extern unsigned long long gbl_delupd_blob_cnt;
 extern unsigned long long gbl_addupd_blob_cnt;
 
-struct field *convert_client_field(CDB2SQLQUERY__Bindvalue *bindvalue,
-                                   struct field *c_fld);
-int bind_parameters(struct reqlogger *logger, sqlite3_stmt *stmt,
-                    struct schema *params, struct sqlclntstate *clnt,
-                    char **err);
 void bind_verify_indexes_query(sqlite3_stmt *stmt, void *sm);
 int verify_indexes_column_value(sqlite3_stmt *stmt, void *sm);
 
@@ -3537,10 +3529,6 @@ int set_rowlocks(void *trans, int enable);
 /* 0: Return null constraint error for not-null constraint violation on updates
    1: Return conversion error instead */
 extern int gbl_upd_null_cstr_return_conv_err;
-
-/* High availability getter & setter */
-int get_high_availability(struct sqlclntstate *clnt);
-void set_high_availability(struct sqlclntstate *clnt, int val);
 
 /* Update the tunable at runtime. */
 comdb2_tunable_err handle_runtime_tunable(const char *name, const char *value);

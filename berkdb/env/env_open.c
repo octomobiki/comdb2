@@ -225,9 +225,6 @@ __dbenv_open(dbenv, db_home, flags, mode)
 	if (LF_ISSET(DB_ROWLOCKS))
 		F_SET(dbenv, DB_ENV_ROWLOCKS);
 
-    if ((ret = pthread_mutex_init(&dbenv->durable_lsn_lk, NULL)) != 0)
-        goto err;
-
 	/* Default permissions are read-write for both owner and group. */
 	dbenv->db_mode = mode == 0 ? __db_omode("rwrw--") : mode;
 #endif
@@ -344,6 +341,7 @@ __dbenv_open(dbenv, db_home, flags, mode)
 		    offsetof(struct __ltrans_descriptor, lnk));
 		pthread_mutex_init(&dbenv->ltrans_inactive_lk, NULL);
 		pthread_mutex_init(&dbenv->ltrans_active_lk, NULL);
+		pthread_mutex_init(&dbenv->locked_lsn_lk, NULL);
 	}
 
 	if (LF_ISSET(DB_INIT_TXN)) {
@@ -855,7 +853,10 @@ __dbenv_close(dbenv, rep_check)
 	if (dbenv->comdb2_dirs.tmp_dir != NULL)
 		__os_free(dbenv, dbenv->comdb2_dirs.tmp_dir);
 
-        pthread_mutex_destroy(&dbenv->durable_lsn_lk);
+	if (dbenv->ltrans_hash != NULL) {
+        hash_clear(dbenv->ltrans_hash);
+        hash_free(dbenv->ltrans_hash);
+    }
 
 	/* Release DB list */
 	__os_free(dbenv, dbenv->dbs);

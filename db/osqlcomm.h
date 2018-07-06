@@ -24,7 +24,6 @@
 #include "block_internal.h"
 #include "comdb2uuid.h"
 #include "schemachange.h"
-#include "bpfunc.pb-c.h"
 
 #define OSQL_SEND_ERROR_WRONGMASTER (-1234)
 /**
@@ -49,7 +48,7 @@ void osql_comm_destroy(void);
  * It is used mainly with blocksql
  *
  */
-int osql_comm_blkout_node(char *host);
+int osql_comm_blkout_node(const char *host);
 
 /* Offload upgrade record request. */
 int offload_comm_send_upgrade_record(const char *tbl, unsigned long long genid);

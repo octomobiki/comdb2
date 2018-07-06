@@ -60,7 +60,6 @@
 #include "logmsg.h"
 
 extern struct dbenv *thedb;
-extern void hexdump(const void *buf, int size);
 extern pthread_mutex_t csc2_subsystem_mtx;
 
 pthread_key_t unique_tag_key;
@@ -924,37 +923,33 @@ const char *strtype(int type)
 int get_size_of_schema(const struct schema *sc)
 {
     int sz;
-    int idx;
-    int maxalign = 0;
-
     struct field *last_field = &sc->member[sc->nmembers - 1];
     sz = last_field->offset + last_field->len;
+    if (!(sc->flags & SCHEMA_TABLE))
+        return sz;
+
     /* if it's a table, fiddle with size so alignment rules match cmacc */
-    if (sc->flags & SCHEMA_TABLE) {
-        /* actually, we might have this information from csc2lib, in which case
-         * just believe him. -- Sam J */
-        if (sc->recsize > 0) {
-            sz = sc->recsize;
-        } else {
-            /* we wind up in here for dynamic schemas */
-            for (idx = 0; idx < sc->nmembers; idx++) {
-                if ((sc->member[idx].type < SERVER_MINTYPE ||
-                     sc->member[idx].type > SERVER_MAXTYPE) &&
-                    sc->member[idx].type != CLIENT_CSTR &&
-                    sc->member[idx].type != CLIENT_PSTR &&
-                    sc->member[idx].type != CLIENT_PSTR2 &&
-                    sc->member[idx].type != CLIENT_BYTEARRAY &&
-                    sc->member[idx].len > maxalign) {
-                    maxalign = sc->member[idx].len;
-                }
-            }
+    /* actually, we might have this information from csc2lib, in which case
+     * just believe him. -- Sam J */
+    if (sc->recsize > 0)
+        return sc->recsize;
+
+    /* we wind up in here for dynamic schemas */
+    int maxalign = 0;
+    for (int idx = 0; idx < sc->nmembers; idx++) {
+        if ((sc->member[idx].type < SERVER_MINTYPE ||
+             sc->member[idx].type > SERVER_MAXTYPE) &&
+            sc->member[idx].type != CLIENT_CSTR &&
+            sc->member[idx].type != CLIENT_PSTR &&
+            sc->member[idx].type != CLIENT_PSTR2 &&
+            sc->member[idx].type != CLIENT_BYTEARRAY &&
+            sc->member[idx].len > maxalign) {
+            maxalign = sc->member[idx].len;
         }
     }
 
-    if (maxalign) {
-        if (sz % maxalign)
-            sz += (maxalign - sz % maxalign);
-    }
+    if (maxalign && (sz % maxalign) )
+        sz += (maxalign - sz % maxalign);
 
     return sz;
 }
@@ -1553,8 +1548,8 @@ static int create_key_schema(struct dbtable *db, struct schema *schema, int alt)
     struct schema *s;
 
     /* keys not reqd for ver temp table; just ondisk tag */
-    if (strncasecmp(dbname, gbl_ver_temp_table, strlen(gbl_ver_temp_table)) ==
-        0)
+    if (strncasecmp(dbname, gbl_ver_temp_table,
+                    sizeof(gbl_ver_temp_table) - 1) == 0)
         return 0;
 
     schema->nix = dyns_get_idx_count();
@@ -1578,6 +1573,9 @@ static int create_key_schema(struct dbtable *db, struct schema *schema, int alt)
 
         if (dyns_is_idx_datacopy(ix))
             s->flags |= SCHEMA_DATACOPY;
+
+        if (dyns_is_idx_uniqnulls(ix))
+            s->flags |= SCHEMA_UNIQNULLS;
 
         s->nix = 0;
         s->ix = NULL;
@@ -4895,8 +4893,8 @@ int cmp_index_int(struct schema *oldix, struct schema *newix, char *descr,
     int oldattr, newattr;
 
     /* First compare attributes */
-    oldattr = oldix->flags & (SCHEMA_DUP | SCHEMA_RECNUM | SCHEMA_DATACOPY);
-    newattr = newix->flags & (SCHEMA_DUP | SCHEMA_RECNUM | SCHEMA_DATACOPY);
+    oldattr = oldix->flags & (SCHEMA_DUP | SCHEMA_RECNUM | SCHEMA_DATACOPY | SCHEMA_UNIQNULLS);
+    newattr = newix->flags & (SCHEMA_DUP | SCHEMA_RECNUM | SCHEMA_DATACOPY | SCHEMA_UNIQNULLS);
     if (oldattr != newattr) {
         if (descr)
             snprintf(descr, descrlen, "properties have changed");
@@ -5006,12 +5004,6 @@ int compare_indexes(const char *table, FILE *out)
     return 0;
 }
 
-void hexdumpdta(unsigned char *p, int len)
-{
-    for (int i = 0; i < len; i++)
-        logmsg(LOGMSG_USER, "%02x", p[i]);
-}
-
 void printrecord(char *buf, struct schema *sc, int len)
 {
     int field;
@@ -5092,7 +5084,7 @@ void printrecord(char *buf, struct schema *sc, int len)
                 logmsg(LOGMSG_USER, "%s=NULL", f->name);
             else {
                 logmsg(LOGMSG_USER, "%s=", f->name);
-                hexdumpdta((void *)sval, flen);
+                hexdump(LOGMSG_USER, (void *)sval, flen);
             }
             free(sval);
 
@@ -5246,7 +5238,6 @@ static int add_cmacc_stmt_int(struct dbtable *db, int alt, int side_effects)
     int itag;
     char *tag = NULL;
     int isnull;
-    int is_disk_schema = 0;
     char tmptagname[MAXTAGLEN] = {0};
     char *rtag = NULL;
     int have_comdb2_seqno_field;
@@ -5291,12 +5282,7 @@ static int add_cmacc_stmt_int(struct dbtable *db, int alt, int side_effects)
         schema->ix = NULL;
         schema->nix = 0;
         offset = 0;
-        is_disk_schema = 0;
-        if (strncasecmp(rtag, ".ONDISK", 7) == 0) {
-            is_disk_schema = 1;
-        } else {
-            is_disk_schema = 0;
-        }
+        int is_disk_schema = (strncasecmp(rtag, ".ONDISK", 7) == 0);
 
         for (field = 0; field < schema->nmembers; field++) {
             int outdtsz = 0;
@@ -5309,7 +5295,7 @@ static int add_cmacc_stmt_int(struct dbtable *db, int alt, int side_effects)
                 (int *)&schema->member[field].type,
                 (int *)&schema->member[field].offset, NULL,
                 (int *)&schema->member[field].len, /* want fullsize, not size */
-                NULL, strncasecmp(rtag, ".ONDISK", 7) == 0);
+                NULL, is_disk_schema);
             schema->member[field].idx = -1;
             schema->member[field].name = strdup(buf);
             schema->member[field].in_default = NULL;
@@ -5322,7 +5308,7 @@ static int add_cmacc_stmt_int(struct dbtable *db, int alt, int side_effects)
                 schema->member[field].type == CLIENT_UINT &&
                 schema->member[field].len == sizeof(unsigned long long) &&
                 strncasecmp(db->tablename, gbl_ver_temp_table,
-                            strlen(gbl_ver_temp_table)) != 0) {
+                            sizeof(gbl_ver_temp_table) - 1) != 0) {
                 logmsg(LOGMSG_ERROR,
                        "Error in table %s: u_longlong is unsupported\n",
                        db->tablename);
@@ -6411,7 +6397,7 @@ void commit_schemas(const char *tblname)
                 }
             }
         } else if (strncasecmp(sc->tag, gbl_ondisk_ver,
-                               strlen(gbl_ondisk_ver))) {
+                               sizeof(gbl_ondisk_ver) - 1)) {
             /* not .NEW. and not .ONDISK_VER. delete */
             listc_rfl(&dbt->taglist, sc);
             listc_abl(&to_be_freed, sc);
@@ -7074,6 +7060,7 @@ static int load_new_ondisk(struct dbtable *db, tran_type *tran)
     int foundix = db->dbs_idx;
     int version = get_csc2_version_tran(db->tablename, tran);
     int len;
+    void *old_bdb_handle, *new_bdb_handle;
     char *csc2 = NULL;
 
     pthread_mutex_lock(&csc2_subsystem_mtx);
@@ -7123,21 +7110,29 @@ static int load_new_ondisk(struct dbtable *db, tran_type *tran)
     }
     pthread_mutex_unlock(&csc2_subsystem_mtx);
 
+    old_bdb_handle = db->handle;
+    new_bdb_handle = newdb->handle;
+
     set_odh_options_tran(newdb, tran);
     transfer_db_settings(db, newdb);
     restore_constraint_pointers(db, newdb);
-    bdb_close_only(db->handle, &bdberr);
-    rc = bdb_free_and_replace(db->handle, newdb->handle, &bdberr);
+    free_db_and_replace(db, newdb);
+    fix_constraint_pointers(db, newdb);
+
+    bdb_close_only(old_bdb_handle, &bdberr);
+    /* swap the handle in place */
+    rc = bdb_free_and_replace(old_bdb_handle, new_bdb_handle, &bdberr);
     if (rc)
         logmsg(LOGMSG_ERROR, "%s:%d bdb_free rc %d %d\n", __FILE__, __LINE__, rc,
                 bdberr);
-    free_db_and_replace(db, newdb);
-    fix_constraint_pointers(db, newdb);
+    db->handle = old_bdb_handle;
+
     memset(newdb, 0xff, sizeof(struct dbtable));
     free(newdb);
     replace_db_idx(db, foundix);
     fix_lrl_ixlen_tran(tran);
     free(csc2);
+    free(new_bdb_handle);
     return 0;
 
 err:
@@ -7447,7 +7442,8 @@ int extract_decimal_quantum(struct dbtable *db, int ix, char *inbuf, char *poutb
             if (bdb_attr_get(thedb->bdb_attr,
                              BDB_ATTR_REPORT_DECIMAL_CONVERSION)) {
                 logmsg(LOGMSG_USER, "Dec extract IN:\n");
-                hexdump(&inbuf[s->member[i].offset], s->member[i].len);
+                hexdump(LOGMSG_USER, &inbuf[s->member[i].offset],
+                        s->member[i].len);
                 logmsg(LOGMSG_USER, "\n");
             }
 
@@ -7462,7 +7458,8 @@ int extract_decimal_quantum(struct dbtable *db, int ix, char *inbuf, char *poutb
             if (bdb_attr_get(thedb->bdb_attr,
                              BDB_ATTR_REPORT_DECIMAL_CONVERSION)) {
                 logmsg(LOGMSG_USER, "Dec extract OUT:\n");
-                hexdump(&inbuf[s->member[i].offset], s->member[i].len);
+                hexdump(LOGMSG_USER, &inbuf[s->member[i].offset],
+                        s->member[i].len);
                 logmsg(LOGMSG_USER, "\n");
             }
         }

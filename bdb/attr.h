@@ -130,7 +130,7 @@ DEF_ATTR(CHECKSUMS, checksums, BOOLEAN, 1,
          "Checksum data pages. Turning this off is highly discouraged.")
 DEF_ATTR(LITTLE_ENDIAN_BTREES, little_endian_btrees, BOOLEAN, 1,
          "Enabling this sets byte ordering for pages to little endian.")
-DEF_ATTR(COMMITDELAYMAX, commitdelaymax, QUANTITY, 8,
+DEF_ATTR(COMMITDELAYMAX, commitdelaymax, QUANTITY, 0,
          "Introduce a delay after each transaction before returning control to "
          "the application. Occasionally useful to allow replicants to catch up "
          "on startup with a very busy system.")
@@ -164,7 +164,7 @@ DEF_ATTR(LOGSEGMENTS, logsegments, QUANTITY, 1,
          "being flushed.")
 
 #ifdef BERKDB_4_2
-#define REPLIMIT_DEFAULT (256 * 1024)
+#define REPLIMIT_DEFAULT (100 * 1024 * 1024)
 #elif defined(BERKDB_4_3) || defined(BERKDB_4_5) || defined(BERKDB_46)
 #define REPLIMIT_DEFAULT (1024 * 1024)
 #else
@@ -296,9 +296,6 @@ DEF_ATTR(
 DEF_ATTR(MIN_KEEP_LOGS_AGE_HWM, min_keep_logs_age_hwm, QUANTITY, 0, NULL)
 DEF_ATTR(LOG_DEBUG_CTRACE_THRESHOLD, log_debug_ctrace_threshold, QUANTITY, 20,
          "Limit trace about log file deletion to this many events.")
-DEF_ATTR(GOOSE_REPLICATION_FOR_INCOHERENT_NODES,
-         goose_replication_for_incoherent_nodes, BOOLEAN, 0,
-         "Call for election for nodes affected by COMMITDELAYBEHINDTHRESH.")
 DEF_ATTR(DISABLE_UPDATE_STRIPE_CHANGE, disable_update_stripe_change, BOOLEAN, 1,
          "Enable to move records between stripes on an update.")
 DEF_ATTR(REP_SKIP_PHASE_3, rep_skip_phase_3, BOOLEAN, 0, NULL)
@@ -479,6 +476,8 @@ DEF_ATTR(SC_ASYNC, sc_async, BOOLEAN, 1,
          "Run transactional schema changes asynchronously.")
 DEF_ATTR(SC_ASYNC_MAXTHREADS, sc_async_maxthreads, QUANTITY, 5,
          "Max number of threads for asynchronous schema changes.")
+DEF_ATTR(SC_DONE_SAME_TRAN, sc_done_same_tran, BOOLEAN, 1,
+         "Write scdone record in the same logical transaction as DDLs.")
 DEF_ATTR(USE_VTAG_ONDISK_VERMAP, use_vtag_ondisk_vermap, BOOLEAN, 1,
          "Use vtag_to_ondisk_vermap conversion function from vtag_to_ondisk.")
 DEF_ATTR(UDP_DROP_DELTA_THRESHOLD, udp_drop_delta_threshold, QUANTITY, 10,
@@ -562,10 +561,10 @@ DEF_ATTR(LEASE_RENEW_INTERVAL, lease_renew_interval, MSECS, 200,
          "How often we renew leases.")
 DEF_ATTR(DOWNGRADE_PENALTY, downgrade_penalty, MSECS, 10000,
          "Prevent upgrades for at least this many ms after a downgrade.")
-DEF_ATTR(CATCHUP_WINDOW, catchup_window, BYTES, 1000000,
+DEF_ATTR(CATCHUP_WINDOW, catchup_window, BYTES, 40000000,
          "Start waiting in waitforseqnum if replicant is within this many "
          "bytes of master.")
-DEF_ATTR(CATCHUP_ON_COMMIT, catchup_on_commit, BOOLEAN, 1,
+DEF_ATTR(CATCHUP_ON_COMMIT, catchup_on_commit, BOOLEAN, 0,
          "Replicant to INCOHERENT_WAIT rather than INCOHERENT on commit if "
          "within CATCHUP_WINDOW.")
 DEF_ATTR(
@@ -608,6 +607,8 @@ DEF_ATTR(TIMEPART_CHECK_SHARD_EXISTENCE, timepart_check_shard_existence,
 DEF_ATTR(
     IGNORE_BAD_TABLE, ignore_bad_table, BOOLEAN, 0,
     "Allow a database with a corrupt table to come up, without that table.")
+DEF_ATTR(TIMEPART_NO_ROLLOUT, timepart_no_rollout, BOOLEAN, 0,
+         "Prevent new rollouts for time partitions.")
 /* Keep enabled for the merge */
 DEF_ATTR(DURABLE_LSNS, durable_lsns, BOOLEAN, 0, NULL)
 /* Keep disabled:  we get it when we add to the trn_repo */
@@ -641,6 +642,8 @@ DEF_ATTR(DEBUG_TIMEPART_SQLITE, dbg_timepart_SQLITE, BOOLEAN, 0, NULL)
 DEF_ATTR(DELAY_FILE_OPEN, delay_file_open, MSECS, 0, NULL)
 DEF_ATTR(DELAY_LOCK_TABLE_RECORD_C, delay_lock_table_record_c, MSECS, 0, NULL)
 
+DEF_ATTR(NET_SEND_GBLCONTEXT, net_send_gblcontext, BOOLEAN, 0,
+         "Enable net_send for USER_TYPE_GBLCONTEXT.")
 /*
   BDB_ATTR_REPTIMEOUT
      amount of time to wait for acks.  when the time is exceeded,

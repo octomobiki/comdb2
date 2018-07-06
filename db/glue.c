@@ -303,15 +303,10 @@ static int trans_start_int_int(struct ireq *iq, tran_type *parent_trans,
                 tran_type * *outtran, int force_commit);
             rc = get_physical_transaction(bdb_handle, *out_trans,
                                           &physical_tran, 0);
-            if (rc == BDBERR_READONLY) {
+            if (rc) {
                 trans_abort_logical(iq, *out_trans, NULL, 0, NULL, 0);
                 *out_trans = NULL;
                 bdberr = rc;
-            }
-            if (rc) {
-                logmsg(LOGMSG_FATAL, "%s :failed to get physical_tran\n",
-                       __func__);
-                abort();
             }
         }
     }
@@ -437,7 +432,7 @@ tran_type *trans_start_readcommitted(struct ireq *iq, int trak)
 }
 
 tran_type *trans_start_snapisol(struct ireq *iq, int trak, int epoch, int file,
-                                int offset, int *error)
+                                int offset, int *error, int is_ha_retry)
 {
     void *bdb_handle = bdb_handle_from_ireq(iq);
     tran_type *out_trans = NULL;
@@ -450,8 +445,8 @@ tran_type *trans_start_snapisol(struct ireq *iq, int trak, int epoch, int file,
         logmsg(LOGMSG_USER, "td=%x %s called with epoch=%d file=%d offset=%d\n",
                (int)pthread_self(), __func__, epoch, file, offset);
     }
-    out_trans =
-        bdb_tran_begin_snapisol(bdb_handle, trak, error, epoch, file, offset);
+    out_trans = bdb_tran_begin_snapisol(bdb_handle, trak, error, epoch, file,
+                                        offset, is_ha_retry);
     iq->gluewhere = "bdb_tran_begin_snapisol done";
 
     if (out_trans == NULL) {
@@ -462,8 +457,9 @@ tran_type *trans_start_snapisol(struct ireq *iq, int trak, int epoch, int file,
     return out_trans;
 }
 
-tran_type *trans_start_serializable(struct ireq *iq, int trak, int epoch, int file,
-        int offset, int *error)
+tran_type *trans_start_serializable(struct ireq *iq, int trak, int epoch,
+                                    int file, int offset, int *error,
+                                    int is_ha_retry)
 {
     void *bdb_handle = bdb_handle_from_ireq(iq);
     tran_type *out_trans = NULL;
@@ -475,8 +471,8 @@ tran_type *trans_start_serializable(struct ireq *iq, int trak, int epoch, int fi
         logmsg(LOGMSG_USER, "td=%x %s called with epoch=%d file=%d offset=%d\n",
                (int)pthread_self(), __func__, epoch, file, offset);
     }
-    out_trans = bdb_tran_begin_serializable(bdb_handle, trak, &bdberr, epoch, 
-            file, offset);
+    out_trans = bdb_tran_begin_serializable(bdb_handle, trak, &bdberr, epoch,
+                                            file, offset, is_ha_retry);
     iq->gluewhere = "bdb_tran_begin done";
 
     if (out_trans == NULL) {
@@ -738,6 +734,8 @@ static int trans_commit_int(struct ireq *iq, void *trans, char *source_host,
 {
     int rc, rc2;
     db_seqnum_type ss;
+    char *cnonce = NULL;
+    int cn_len;
     void *bdb_handle = bdb_handle_from_ireq(iq);
     struct dbenv *dbenv = dbenv_from_ireq(iq);
 
@@ -745,11 +743,30 @@ static int trans_commit_int(struct ireq *iq, void *trans, char *source_host,
 
     rc = trans_commit_seqnum_int(bdb_handle, dbenv, iq, trans, &ss, logical,
                                  blkseq, blklen, blkkey, blkkeylen);
-    if (rc != 0)
+
+    if (gbl_extended_sql_debug_trace && iq->have_snap_info) {
+        cn_len = iq->snap_info.keylen;
+        cnonce = alloca(cn_len + 1);
+        memcpy(cnonce, iq->snap_info.key, cn_len);
+        cnonce[cn_len] = '\0';
+        logmsg(LOGMSG_USER, "%s %s line %d: trans_commit returns %d\n", cnonce,
+               __func__, __LINE__, rc);
+    }
+
+    if (rc != 0) {
         return rc;
+    }
 
     rc = trans_wait_for_seqnum_int(bdb_handle, dbenv, iq, source_host,
                                    timeoutms, adaptive, &ss);
+
+    if (cnonce) {
+        DB_LSN *lsn = (DB_LSN *)&ss;
+        logmsg(LOGMSG_USER,
+               "%s %s line %d: wait_for_seqnum [%d][%d] returns %d\n", cnonce,
+               __func__, __LINE__, lsn->file, lsn->offset, rc);
+    }
+
     return rc;
 }
 
@@ -782,7 +799,7 @@ int trans_commit_adaptive(struct ireq *iq, void *trans, char *source_host)
 int trans_abort_logical(struct ireq *iq, void *trans, void *blkseq, int blklen,
                         void *seqkey, int seqkeylen)
 {
-    int bdberr, rc = 0;
+    int bdberr, rc = 0, *file;
     void *bdb_handle = bdb_handle_from_ireq(iq);
     struct dbenv *dbenv = dbenv_from_ireq(iq);
     db_seqnum_type ss;
@@ -800,11 +817,13 @@ int trans_abort_logical(struct ireq *iq, void *trans, void *blkseq, int blklen,
         else
             rc = ERR_INTERNAL;
     }
-    /* Not sure why we have this inconsistency where we wait for logical commits
-       but
-       not logical aborts, but it's wrong. */
-    trans_wait_for_seqnum_int(bdb_handle, dbenv, iq, gbl_mynode,
-                              -1 /* timeoutms */, 1 /* adaptive */, &ss);
+
+    /* Single phy-txn logical aborts will set ss to 0: check before waiting */
+    file = (u_int32_t *)&ss;
+    if (*file != 0) {
+        trans_wait_for_seqnum_int(bdb_handle, dbenv, iq, gbl_mynode,
+                                  -1 /* timeoutms */, 1 /* adaptive */, &ss);
+    }
     return rc;
 }
 
@@ -870,8 +889,51 @@ int cmp_context(struct ireq *iq, unsigned long long genid,
 /*        TRANSACTIONAL INDEX ROUTINES        */
 /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
 
+int ix_isnullk(void *db_table, void *key, int ixnum)
+{
+    struct dbtable *db = db_table;
+    struct schema *dbixschema;
+    int ifld;
+    if (!db || !key || ixnum < 0 || ixnum >= db->nix) {
+        logmsg(LOGMSG_ERROR,
+            "ix_isnullk: bad args, db = %p, key = %p, ixnum = %d\n",
+            db, key, ixnum);
+        return 0;
+    }
+    if (db->ix_dupes[ixnum]) {
+        return 0;
+    }
+    if (!db->ix_nullsallowed[ixnum]) {
+        return 0;
+    }
+    dbixschema = db->ixschema[ixnum];
+    if (!dbixschema) {
+        logmsg(LOGMSG_ERROR,
+            "ix_isnullk: missing schema, db = %p, key = %p, ixnum = %d\n",
+            db, key, ixnum);
+        return 0;
+    }
+    for (ifld = 0; ifld < dbixschema->nmembers; ifld++) {
+        struct field *dbixfield = &dbixschema->member[ifld];
+        if (dbixfield) {
+            const char *bkey = (const char *)key;
+            int offset = dbixfield->offset;
+            if (offset >= 0 && stype_is_null((bkey + offset))) {
+                /* fprintf(stderr,
+                    "ix_isnullk: found NULL, db = %p, key = %p, ixnum = %d, ifld = %d\n",
+                    db, key, ixnum, ifld); */
+                return 1;
+            }
+        }
+    }
+    /* fprintf(stderr,
+        "ix_isnullk: no NULL, db = %p, key = %p, ixnum = %d\n",
+        db, key, ixnum); */
+    return 0;
+}
+
 int ix_addk_auxdb(int auxdb, struct ireq *iq, void *trans, void *key, int ixnum,
-                  unsigned long long genid, int rrn, void *dta, int dtalen)
+                  unsigned long long genid, int rrn, void *dta, int dtalen, int isnull)
 {
     struct dbtable *db = iq->usedb;
     int rc, bdberr;
@@ -887,14 +949,9 @@ int ix_addk_auxdb(int auxdb, struct ireq *iq, void *trans, void *key, int ixnum,
     if (!bdb_handle)
         return ERR_NO_AUXDB;
 
-#if 0
-    fprintf(stderr, "ix_addkey(%x)\n", ixnum);
-    hexdump(key, getkeysize(db, ixnum));
-#endif
-
     iq->gluewhere = "bdb_prim_addkey";
     rc = bdb_prim_addkey_genid(bdb_handle, trans, key, ixnum, rrn, genid, dta,
-                               dtalen, 0 /* XXX TODO, are there null values? */,
+                               dtalen, isnull,
                                &bdberr);
     iq->gluewhere = "bdb_prim_addkey done";
     if (rc == 0)
@@ -917,15 +974,15 @@ int ix_addk_auxdb(int auxdb, struct ireq *iq, void *trans, void *key, int ixnum,
 
 /*index routines */
 int ix_addk(struct ireq *iq, void *trans, void *key, int ixnum,
-            unsigned long long genid, int rrn, void *dta, int dtalen)
+            unsigned long long genid, int rrn, void *dta, int dtalen, int isnull)
 {
     return ix_addk_auxdb(AUXDB_NONE, iq, trans, key, ixnum, genid, rrn, dta,
-                         dtalen);
+                         dtalen, isnull);
 }
 
 int ix_upd_key(struct ireq *iq, void *trans, void *key, int keylen, int ixnum,
                unsigned long long oldgenid, unsigned long long genid, void *dta,
-               int dtalen)
+               int dtalen, int isnull)
 {
     struct dbtable *db = iq->usedb;
     int rc, bdberr;
@@ -943,7 +1000,7 @@ int ix_upd_key(struct ireq *iq, void *trans, void *key, int keylen, int ixnum,
 
     iq->gluewhere = "bdb_prim_updkey";
     rc = bdb_prim_updkey_genid(bdb_handle, trans, key, keylen, ixnum, genid,
-                               oldgenid, dta, dtalen, &bdberr);
+                               oldgenid, dta, dtalen, isnull, &bdberr);
     iq->gluewhere = "bdb_prim_updkey done";
 
     if (rc == 0)
@@ -965,7 +1022,7 @@ int ix_upd_key(struct ireq *iq, void *trans, void *key, int keylen, int ixnum,
 }
 
 int ix_delk_auxdb(int auxdb, struct ireq *iq, void *trans, void *key, int ixnum,
-                  int rrn, unsigned long long genid)
+                  int rrn, unsigned long long genid, int isnull)
 {
     struct dbtable *db = iq->usedb;
     int rc, bdberr;
@@ -980,7 +1037,7 @@ int ix_delk_auxdb(int auxdb, struct ireq *iq, void *trans, void *key, int ixnum,
         return ERR_NO_AUXDB;
     iq->gluewhere = "bdb_prim_delkey";
     rc = bdb_prim_delkey_genid(bdb_handle, trans, key, ixnum, rrn, genid,
-                               &bdberr);
+                               isnull, &bdberr);
     iq->gluewhere = "bdb_prim_delkey done";
     if (rc == 0)
         return 0;
@@ -1007,14 +1064,14 @@ int ix_delk_auxdb(int auxdb, struct ireq *iq, void *trans, void *key, int ixnum,
 }
 
 int ix_delk(struct ireq *iq, void *trans, void *key, int ixnum, int rrn,
-            unsigned long long genid)
+            unsigned long long genid, int isnull)
 {
-    return ix_delk_auxdb(AUXDB_NONE, iq, trans, key, ixnum, rrn, genid);
+    return ix_delk_auxdb(AUXDB_NONE, iq, trans, key, ixnum, rrn, genid, isnull);
 }
 
-int dat_upv(struct ireq *iq, void *trans, int vptr, void *vdta, int vlen,
-            unsigned long long vgenid, void *newdta, int newlen, int rrn,
-            unsigned long long *genid, int verifydta, int modnum)
+inline int dat_upv(struct ireq *iq, void *trans, int vptr, void *vdta, int vlen,
+                   unsigned long long vgenid, void *newdta, int newlen, int rrn,
+                   unsigned long long *genid, int verifydta, int modnum)
 {
     return dat_upv_auxdb(AUXDB_NONE, iq, trans, vptr, vdta, vlen, vgenid,
                          newdta, newlen, rrn, genid, verifydta, modnum, 0);
@@ -2889,20 +2946,20 @@ static int new_master_callback(void *bdb_handle, char *host)
     ++gbl_master_changes;
     struct dbenv *dbenv;
     char *oldmaster, *newmaster;
-    uint32_t oldegen, egen;
+    uint32_t oldgen, gen, egen;
     int trigger_timepart = 0;
     dbenv = bdb_get_usr_ptr(bdb_handle);
     oldmaster = dbenv->master;
-    oldegen = dbenv->egen;
+    oldgen = dbenv->gen;
     dbenv->master = host;
 
-    bdb_get_rep_master(bdb_handle, &newmaster, &egen);
+    bdb_get_rep_master(bdb_handle, &newmaster, &gen, &egen);
     if (gbl_master_swing_osql_verbose)
         logmsg(LOGMSG_INFO,
                "%s:%d new master node %s, rep_master %s, rep_egen %u\n",
                __func__, __LINE__, host ? host : "NULL",
                newmaster ? newmaster : "NULL", egen);
-    dbenv->egen = egen;
+    dbenv->gen = gen;
     /*this is only used when handle not established yet. */
     if (host == gbl_mynode) {
         if (oldmaster != host) {
@@ -2918,7 +2975,7 @@ static int new_master_callback(void *bdb_handle, char *host)
             trigger_clear_hash();
             trigger_timepart = 1;
 
-            if (oldegen != egen) {
+            if (oldgen != gen) {
                 osql_repository_cancelall();
             }
         }
@@ -3938,59 +3995,61 @@ int open_bdb_env(struct dbenv *dbenv)
 
         /* callbacks for schema changes */
         if (net_register_handler(dbenv->handle_sibling, NET_QUIESCE_THREADS,
-                                 net_quiesce_threads))
+                                 "quiesce_threads", net_quiesce_threads))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_RESUME_THREADS,
-                                 net_resume_threads))
+                                 "resume_threads", net_resume_threads))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_NEW_QUEUE,
-                                 net_new_queue))
+                                 "new_queue", net_new_queue))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_ADD_CONSUMER,
-                                 net_add_consumer))
+                                 "add_consumer", net_add_consumer))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_JAVASP_OP,
-                                 net_javasp_op))
+                                 "javasp_op", net_javasp_op))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_PREFAULT_OPS,
-                                 net_prefault_ops))
+                                 "prefault_ops", net_prefault_ops))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_PREFAULT2_OPS,
-                                 net_prefault2_ops))
+                                 "prefault2_ops", net_prefault2_ops))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_CLOSE_ALL_DBS,
-                                 net_close_all_dbs))
+                                 "close_all_dbs", net_close_all_dbs))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_MORESTRIPE_OPEN_DBS,
+                                 "morestripe_and_open_all_dbs",
                                  net_morestripe_and_open_all_dbs))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_CHECK_SC_OK,
-                                 net_check_sc_ok))
+                                 "check_sc_ok", net_check_sc_ok))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_START_SC,
-                                 net_start_sc))
+                                 "start_sc", net_start_sc))
             return -1;
-        if (net_register_handler(dbenv->handle_sibling, NET_STOP_SC,
+        if (net_register_handler(dbenv->handle_sibling, NET_STOP_SC, "stop_sc",
                                  net_stop_sc))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_FLUSH_ALL,
-                                 net_flush_all))
+                                 "flush_all", net_flush_all))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_FORGETMENOT,
-                                 net_forgetmenot))
+                                 "forgetmenot", net_forgetmenot))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_TRIGGER_REGISTER,
-                                 net_trigger_register))
+                                 "trigger_register", net_trigger_register))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_TRIGGER_UNREGISTER,
-                                 net_trigger_unregister))
+                                 "trigger_unregister", net_trigger_unregister))
             return -1;
         if (net_register_handler(dbenv->handle_sibling, NET_TRIGGER_START,
-                                 net_trigger_start))
+                                 "trigger_start", net_trigger_start))
             return -1;
         /* Authentication Check */
-        if (net_register_handler(dbenv->handle_sibling, NET_AUTHENTICATION_CHECK,
-                                 net_authentication_check))
+        if (net_register_handler(
+                dbenv->handle_sibling, NET_AUTHENTICATION_CHECK,
+                "authentication_check", net_authentication_check))
             return -1;
         if (net_register_allow(dbenv->handle_sibling, net_allow_node))
             return -1;
@@ -4138,10 +4197,9 @@ int backend_open(struct dbenv *dbenv)
                     dbenv->basedir, db->tablename, bdberr);
                 /* this is a hack, lets just leak it */
                 if (ii == dbenv->num_dbs - 1) {
-                    dbenv->dbs[ii] == NULL;
+                    dbenv->dbs[ii] = NULL;
                 } else {
-                    memcpy(dbenv->dbs[ii], dbenv->dbs[ii + 1],
-                           sizeof(dbenv->dbs[0]));
+                    *dbenv->dbs[ii] = *dbenv->dbs[ii + 1];
                     dbenv->dbs[dbenv->num_dbs - 1] = NULL;
                 }
                 dbenv->num_dbs--;
@@ -4523,7 +4581,7 @@ retry:
             goto backout;
         }
 
-        rc = ix_addk(&iq, trans, key, i, genid, rrn, buf, db->lrl);
+        rc = ix_addk(&iq, trans, key, i, genid, rrn, buf, db->lrl, ix_isnullk(iq.usedb, key, i));
         if (rc) {
             if (rc == RC_INTERNAL_RETRY)
                 need_to_retry = 1;
@@ -4897,7 +4955,7 @@ retry:
             if (iq.debug)
                 logmsg(LOGMSG_USER, "meta_put:update genid 0x%llx rrn %d\n", genid, rrn);
             /* delete old key */
-            rc = ix_delk_auxdb(AUXDB_META, &iq, trans, hdr, 0, rrn, genid);
+            rc = ix_delk_auxdb(AUXDB_META, &iq, trans, hdr, 0, rrn, genid, ix_isnullk(iq.usedb, hdr, 0));
             if (iq.debug)
                 logmsg(LOGMSG_USER, "meta_put:ix_delk_auxdb RC %d\n", rc);
             if (rc)
@@ -4919,7 +4977,7 @@ retry:
             if (rc)
                 goto backout;
         }
-        rc = ix_addk_auxdb(AUXDB_META, &iq, trans, hdr, 0, genid, rrn, NULL, 0);
+        rc = ix_addk_auxdb(AUXDB_META, &iq, trans, hdr, 0, genid, rrn, NULL, 0, ix_isnullk(iq.usedb, hdr, 0));
         if (iq.debug)
             logmsg(LOGMSG_USER, "meta_put:ix_addk_auxdb RC %d\n", rc);
         if (rc)

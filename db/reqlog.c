@@ -1739,10 +1739,10 @@ void reqlog_end_request(struct reqlogger *logger, int rc, const char *callfunc,
     /* If fingerprinting is enabled and the logger has a fingerprint,
        log the fingerprint as well. */
     if (gbl_fingerprint_queries && logger->have_fingerprint) {
-        char hexfp[FINGERPRINTSZ << 1];
-        if (reqlog_fingerprint_to_hex(logger, hexfp, FINGERPRINTSZ << 1) > 0)
-            reqlog_logf(logger, REQL_INFO, "fingerprint=%.*s",
-                        FINGERPRINTSZ << 1, hexfp);
+        char expanded_fp[2 * FINGERPRINTSZ + 1];
+        util_tohex(expanded_fp, logger->fingerprint, FINGERPRINTSZ);
+        reqlog_logf(logger, REQL_INFO, "fingerprint=%.*s", FINGERPRINTSZ * 2,
+                    expanded_fp);
     }
 
     logger->in_request = 0;
@@ -2135,30 +2135,36 @@ static nodestats_t *find_clientstats(unsigned checksum, int node, int fd)
     return NULL;
 }
 
-static void release_clientstats(unsigned checksum, int node)
+static int release_clientstats(unsigned checksum, int node)
 {
+    int rc = 0;
     nodestats_t key;
     nodestats_t *entry = NULL;
     key.checksum = checksum;
     key.node = node;
     pthread_rwlock_rdlock(&clientstats_lk);
     {
-        entry = hash_find_readonly(clientstats, &key);
-        pthread_mutex_lock(&entry->mtx);
-        entry->ref--;
-        if (entry->ref < 0) {
-            logmsg(LOGMSG_ERROR, "key released more often than found, ref %d\n",
-                   entry->ref);
-            entry->ref = 0;
+        if ((entry = hash_find_readonly(clientstats, &key)) != NULL) {
+            pthread_mutex_lock(&entry->mtx);
+            entry->ref--;
+            if (entry->ref < 0) {
+                logmsg(LOGMSG_ERROR,
+                       "key released more often than found, ref %d\n",
+                       entry->ref);
+                entry->ref = 0;
+            }
+            if (entry->ref == 0) {
+                pthread_mutex_lock(&clntlru_mtx);
+                listc_abl(&clntlru, entry);
+                pthread_mutex_unlock(&clntlru_mtx);
+            }
+            pthread_mutex_unlock(&entry->mtx);
+        } else {
+            rc = -1;
         }
-        if (entry->ref == 0) {
-            pthread_mutex_lock(&clntlru_mtx);
-            listc_abl(&clntlru, entry);
-            pthread_mutex_unlock(&clntlru_mtx);
-        }
-        pthread_mutex_unlock(&entry->mtx);
     }
     pthread_rwlock_unlock(&clientstats_lk);
+    return rc;
 }
 
 struct rawnodestats *get_raw_node_stats(const char *task, const char *stack,
@@ -2209,6 +2215,7 @@ int release_node_stats(const char *task, const char *stack, char *host)
     int task_len, stack_len = 0;
     char *tmp;
 
+    host = intern(host);
     task_len = strlen(NAME(task)) + 1;
     stack_len = strlen(NAME(stack)) + 1;
     namelen = task_len + stack_len;
@@ -2221,7 +2228,12 @@ int release_node_stats(const char *task, const char *stack, char *host)
     memcpy(tmp, NAME(task), task_len);
     memcpy(tmp + task_len, NAME(stack), stack_len);
     checksum = crc32c(tmp, namelen);
-    release_clientstats(checksum, nodeix(host));
+    if (release_clientstats(checksum, nodeix(host)) != 0) {
+        logmsg(LOGMSG_ERROR,
+               "%s: failed to release host=%s, node=%d, task=%s, stack=%s\n",
+               __func__, host, nodeix(host), NAME(task), NAME(stack));
+        cheap_stack_trace();
+    }
 
     if (tmp && namelen >= 1024)
         free(tmp);
@@ -2673,11 +2685,6 @@ void reqlog_set_fingerprint(struct reqlogger *logger, const char *fingerprint,
     logger->have_fingerprint = 1;
 }
 
-void reqlog_set_request(struct reqlogger *logger, CDB2SQLQUERY *request)
-{
-    logger->request = request;
-}
-
 void reqlog_set_event(struct reqlogger *logger, const char *evtype)
 {
     logger->event_type = evtype;
@@ -2711,25 +2718,7 @@ void reqlog_set_context(struct reqlogger *logger, int ncontext, char **context)
     logger->context = context;
 }
 
-int reqlog_fingerprint_to_hex(struct reqlogger *logger, char *hexstr, size_t n)
+void reqlog_set_clnt(struct reqlogger *logger, struct sqlclntstate *clnt)
 {
-    static const char hex[] = "0123456789abcdef";
-    size_t i, len;
-
-    if (!gbl_fingerprint_queries)
-        return 0;
-
-    if (n & 1)
-        return 0;
-
-    if (logger == NULL)
-        return 0;
-
-    for (i = 0, len = ((n >> 1) < FINGERPRINTSZ) ? (n >> 1) : FINGERPRINTSZ;
-         i != len; ++i) {
-        hexstr[i << 1] = hex[(logger->fingerprint[i] & 0xf0) >> 4];
-        hexstr[(i << 1) + 1] = hex[logger->fingerprint[i] & 0x0f];
-    }
-
-    return (i << 1);
+    logger->clnt = clnt;
 }

@@ -116,7 +116,7 @@ int start_schema_change_tran(struct ireq *iq, tran_type *trans)
             int bdberr;
             void *packed_sc_data = NULL;
             size_t packed_sc_data_len;
-            if (bdb_get_in_schema_change(s->table, &packed_sc_data,
+            if (bdb_get_in_schema_change(trans, s->table, &packed_sc_data,
                                          &packed_sc_data_len, &bdberr) ||
                 bdberr != BDBERR_NOERROR) {
                 logmsg(LOGMSG_WARN, "%s: failed to discover whether table: "
@@ -193,13 +193,16 @@ int start_schema_change_tran(struct ireq *iq, tran_type *trans)
             return SC_MASTER_DOWNGRADE;
         }
     } else {
-        seed = get_next_sc_seed(thedb->bdb_env);
+        seed = bdb_get_a_genid(thedb->bdb_env);
         logmsg(LOGMSG_INFO, "Starting schema change: new seed 0x%llx\n", seed);
     }
-
+    uuidstr_t us;
+    comdb2uuidstr(s->uuid, us);
     rc = sc_set_running(s->table, 1, seed, node, time(NULL));
     if (rc != 0) {
-        if (!doing_upgrade || s->fulluprecs || s->partialuprecs) {
+        logmsg(LOGMSG_INFO, "Failed sc_set_running [%llx %s] rc %d\n", s->rqid,
+               us, rc);
+        if (!s->db->doing_upgrade || s->fulluprecs || s->partialuprecs) {
             errstat_set_strf(&iq->errstat, "Schema change already in progress");
             free_schema_change_type(s);
             return SC_CANT_SET_RUNNING;
@@ -214,21 +217,24 @@ int start_schema_change_tran(struct ireq *iq, tran_type *trans)
             // give time to let upgrade threads exit
             while (maxcancelretry-- > 0) {
                 sleep(1);
-                if (!doing_upgrade) break;
+                if (!s->db->doing_upgrade)
+                    break;
             }
 
-            if (doing_upgrade) {
+            if (s->db->doing_upgrade) {
                 sc_errf(s, "failed to cancel table upgrade threads\n");
                 free_schema_change_type(s);
                 return SC_CANT_SET_RUNNING;
             } else if (sc_set_running(s->table, 1,
-                                      get_next_sc_seed(thedb->bdb_env),
+                                      bdb_get_a_genid(thedb->bdb_env),
                                       gbl_mynode, time(NULL)) != 0) {
                 free_schema_change_type(s);
                 return SC_CANT_SET_RUNNING;
             }
         }
     }
+
+    logmsg(LOGMSG_INFO, "sc_set_running schemachange [%llx %s]\n", s->rqid, us);
 
     iq->sc_host = node ? crc32c((uint8_t *)node, strlen(node)) : 0;
     if (thedb->master == gbl_mynode && !s->resume && iq->sc_seed != seed) {
@@ -325,12 +331,13 @@ int start_schema_change(struct schema_change_type *s)
 
 void delay_if_sc_resuming(struct ireq *iq)
 {
-    if (gbl_sc_resume_start == 0) return;
+    if (gbl_sc_resume_start <= 0)
+        return;
 
     int diff;
     int printerr = 0;
     int start_time = comdb2_time_epochms();
-    while (gbl_sc_resume_start) {
+    while (gbl_sc_resume_start > 0) {
         if ((diff = comdb2_time_epochms() - start_time) > 300 && !printerr) {
             logmsg(LOGMSG_WARN, "Delaying since gbl_sc_resume_start has not "
                                 "been reset to 0 for %dms\n",
@@ -569,6 +576,9 @@ int live_sc_post_delete_int(struct ireq *iq, void *trans,
                             unsigned long long del_keys,
                             blob_buffer_t *oldblobs)
 {
+    if (iq->usedb->sc_downgrading)
+        return ERR_NOMASTER;
+
     if (iq->usedb->sc_from != iq->usedb) {
         return 0;
     }
@@ -618,6 +628,9 @@ int live_sc_post_add_int(struct ireq *iq, void *trans, unsigned long long genid,
                          blob_buffer_t *blobs, size_t maxblobs, int origflags,
                          int *rrn)
 {
+    if (iq->usedb->sc_downgrading)
+        return ERR_NOMASTER;
+
     if (iq->usedb->sc_from != iq->usedb) {
         return 0;
     }
@@ -710,6 +723,9 @@ int live_sc_post_update_int(struct ireq *iq, void *trans,
                             int origflags, int rrn, int deferredAdd,
                             blob_buffer_t *oldblobs, blob_buffer_t *newblobs)
 {
+    if (iq->usedb->sc_downgrading)
+        return ERR_NOMASTER;
+
     if (iq->usedb->sc_from != iq->usedb) {
         return 0;
     }
@@ -914,8 +930,9 @@ int add_schema_change_tables()
         int bdberr;
         void *packed_sc_data = NULL;
         size_t packed_sc_data_len = 0;
-        if (bdb_get_in_schema_change(thedb->dbs[i]->tablename, &packed_sc_data,
-                                     &packed_sc_data_len, &bdberr) ||
+        if (bdb_get_in_schema_change(NULL /*tran*/, thedb->dbs[i]->tablename,
+                                     &packed_sc_data, &packed_sc_data_len,
+                                     &bdberr) ||
             bdberr != BDBERR_NOERROR) {
             logmsg(LOGMSG_ERROR,
                    "%s: failed to discover "
@@ -1063,8 +1080,8 @@ int sc_timepart_add_table(const char *existingTableName,
         goto error;
     }
 
-    if (sc_set_running(sc.table, 1, get_next_sc_seed(thedb->bdb_env),
-                       gbl_mynode, time(NULL)) != 0) {
+    if (sc_set_running(sc.table, 1, bdb_get_a_genid(thedb->bdb_env), gbl_mynode,
+                       time(NULL)) != 0) {
         xerr->errval = SC_VIEW_ERR_EXIST;
         snprintf(xerr->errstr, sizeof(xerr->errstr), "schema change running");
         goto error;
@@ -1131,8 +1148,8 @@ int sc_timepart_drop_table(const char *tableName, struct errstat *xerr)
         goto error;
     }
 
-    if (sc_set_running(sc.table, 1, get_next_sc_seed(thedb->bdb_env),
-                       gbl_mynode, time(NULL)) != 0) {
+    if (sc_set_running(sc.table, 1, bdb_get_a_genid(thedb->bdb_env), gbl_mynode,
+                       time(NULL)) != 0) {
         xerr->errval = SC_VIEW_ERR_EXIST;
         snprintf(xerr->errstr, sizeof(xerr->errstr), "schema change running");
         goto error;
@@ -1329,7 +1346,7 @@ void sc_printf(struct schema_change_type *s, const char *fmt, ...)
     va_list args;
     va_start(args, fmt);
 
-    if (s->partialuprecs) {
+    if (s && s->partialuprecs) {
         va_end(args);
         return;
     }
@@ -1349,7 +1366,7 @@ void sc_errf(struct schema_change_type *s, const char *fmt, ...)
     va_list args;
     va_start(args, fmt);
 
-    if (s->partialuprecs) {
+    if (s && s->partialuprecs) {
         va_end(args);
         return;
     }

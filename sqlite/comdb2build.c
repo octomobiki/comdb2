@@ -27,10 +27,14 @@
 #define INCLUDE_KEYWORDHASH_H
 #define INCLUDE_FINALKEYWORD_H
 #include <keywordhash.h>
+
 extern pthread_key_t query_info_key;
 extern int gbl_commit_sleep;
 extern int gbl_convert_sleep;
 extern int gbl_check_access_controls;
+extern int gbl_allow_user_schema;
+extern int gbl_ddl_cascade_drop;
+
 /******************* Utility ****************************/
 
 static inline int setError(Parse *pParse, int rc, const char *msg)
@@ -93,8 +97,6 @@ static inline int isRemote(Parse *pParse, Token **t1, Token **t2)
     return setError(pParse, SQLITE_MISUSE,
                     "DDL commands operate on local schema only.");
 }
-
-extern int gbl_allow_user_schema;
 
 static inline int chkAndCopyTable(Parse *pParse, char *dst, const char *name,
                                   size_t max_length, int mustexist)
@@ -711,6 +713,7 @@ static inline void comdb2Rebuild(Parse *pParse, Token* nm, Token* lnm, int opt)
     sc->commit_sleep = gbl_commit_sleep;
     sc->convert_sleep = gbl_convert_sleep;
 
+    sc->same_schema = 1;
     if(get_csc2_file(sc->table, -1 , &sc->newcsc2, NULL ))
     {
         logmsg(LOGMSG_ERROR, "%s: table schema not found: %s\n", __func__,
@@ -799,6 +802,7 @@ void comdb2RebuildIndex(Parse* pParse, Token* nm, Token* lnm, Token* index, int 
     if (authenticateSC(sc->table, pParse))
         goto out;
 
+    sc->same_schema = 1;
     if(get_csc2_file(sc->table, -1 , &sc->newcsc2, NULL )) {
         logmsg(LOGMSG_ERROR, "%s: table schema not found: %s\n", __func__,
                sc->table);
@@ -1856,6 +1860,7 @@ enum {
     KEY_DUP = 1 << 0,
     KEY_DATACOPY = 1 << 1,
     KEY_DELETED = 1 << 2,
+    KEY_UNIQNULLS = 1 << 3
 };
 
 struct comdb2_key {
@@ -2384,6 +2389,10 @@ static char *format_csc2(struct comdb2_ddl_context *ctx)
             strbuf_append(csc2, "datacopy ");
         }
 
+        if ((key->flags & KEY_UNIQNULLS) != 0) {
+            strbuf_append(csc2, "uniqnulls ");
+        }
+
         strbuf_appendf(csc2, "\"%s\" = ", key->name);
 
         int added = 0;
@@ -2496,6 +2505,10 @@ static int gen_key_name(struct comdb2_key *key, const char *table, char *out,
     /* DUP */
     if (key->flags & KEY_DUP)
         SNPRINTF(buf, sizeof(buf), pos, "%s", "DUP")
+
+    /* UNIQNULLS */
+    if (key->flags & KEY_UNIQNULLS)
+        SNPRINTF(buf, sizeof(buf), pos, "%s", "UNIQNULLS")
 
     LISTC_FOR_EACH(&key->idx_col_list, idx_column, lnk)
     {
@@ -3018,6 +3031,9 @@ static int retrieve_schema(Parse *pParse, struct comdb2_ddl_context *ctx)
         }
         if (schema->ix[i]->flags & SCHEMA_DATACOPY) {
             key->flags |= KEY_DATACOPY;
+        }
+        if (schema->ix[i]->flags & SCHEMA_UNIQNULLS) {
+            key->flags |= KEY_UNIQNULLS;
         }
 
         listc_init(&key->idx_col_list,
@@ -3805,6 +3821,8 @@ static void comdb2AddIndexInt(
         /* For CREATE INDEX, we need to check onError */
         if (onError != OE_Abort) {
             key->flags |= KEY_DUP;
+        } else {
+            key->flags |= KEY_UNIQNULLS;
         }
     }
 
@@ -3868,9 +3886,9 @@ static void comdb2AddIndexInt(
         char *where_clause;
         size_t where_sz;
 
-        where_sz = pPIWhere->zEnd - pPIWhere->zStart - 2;
+        where_sz = pPIWhere->zEnd - pPIWhere->zStart;
         assert(where_sz > 0);
-        where_clause = comdb2_strndup(ctx->mem, pPIWhere->zStart + 1, where_sz);
+        where_clause = comdb2_strndup(ctx->mem, pPIWhere->zStart, where_sz + 1);
         if (where_clause == 0)
             goto oom;
 
@@ -4475,28 +4493,38 @@ cleanup:
 }
 
 /*
-  Iterate through the list of constraints and drop ones associated with
-  this key.
-*/
-static void drop_dependent_cons(struct comdb2_ddl_context *ctx,
-                                struct comdb2_key *key)
+ * Check whether the specified key has any existing associated
+ * constraint(s) and drop if asked.
+ */
+static int check_dependent_cons(struct comdb2_ddl_context *ctx,
+                                struct comdb2_key *key, int drop)
 {
     struct comdb2_constraint *constraint;
 
     LISTC_FOR_EACH(&ctx->schema->constraint_list, constraint, lnk)
     {
+        /* Skip if the constraint has already been dropped. */
+        if (constraint->flags & CONS_DELETED) {
+            continue;
+        }
+
         if (constraint->child == key) {
-            constraint->flags |= CONS_DELETED;
+            if (drop) {
+                constraint->flags |= CONS_DELETED;
+            } else {
+                return 1;
+            }
         }
     }
-    return;
+    return 0;
 }
 
 /*
-  Remove the specified column from the current keys.
-*/
-static void drop_dependent_keys(struct comdb2_ddl_context *ctx,
-                                const char *column)
+ * Check whether the specified column has any existing associated
+ * key(s) and drop if asked.
+ */
+static int check_dependent_keys(struct comdb2_ddl_context *ctx,
+                                const char *column, int drop)
 {
     struct comdb2_key *key;
     struct comdb2_index_column *idx_col;
@@ -4511,15 +4539,19 @@ static void drop_dependent_keys(struct comdb2_ddl_context *ctx,
         LISTC_FOR_EACH(&key->idx_col_list, idx_col, lnk)
         {
             if (strcasecmp(idx_col->name, column) == 0) {
-                /* Also drop the dependent constraints */
-                drop_dependent_cons(ctx, key);
+                if (drop) {
+                    /* Drop the dependent constraints. */
+                    check_dependent_cons(ctx, key, 1);
 
-                /* Mark the key as deleted. */
-                key->flags |= KEY_DELETED;
+                    /* Mark the key as deleted. */
+                    key->flags |= KEY_DELETED;
+                } else {
+                    return 1;
+                }
             }
         }
     }
-    return;
+    return 0;
 }
 
 /*
@@ -4550,8 +4582,15 @@ void comdb2DropColumn(Parse *pParse, /* Parser context */
     LISTC_FOR_EACH(&ctx->schema->column_list, column, lnk)
     {
         if ((strcasecmp(name, column->name)) == 0) {
-            /* Drop the index referring to this column. */
-            drop_dependent_keys(ctx, name);
+            /* Check whether an index is referring to this column. */
+            if (check_dependent_keys(ctx, name, gbl_ddl_cascade_drop)) {
+                pParse->rc = SQLITE_ERROR;
+                sqlite3ErrorMsg(pParse,
+                                "Column '%s' cannot be dropped as it is part "
+                                "of an existing key.",
+                                name);
+                goto cleanup;
+            }
 
             /* Mark the column as deleted. */
             column->flags |= COLUMN_DELETED;
@@ -4594,8 +4633,15 @@ void comdb2DropIndexInt(Parse *pParse, char *idx_name)
         sqlite3ErrorMsg(pParse, "Key '%s' not found.", idx_name);
         goto cleanup;
     } else {
-        /* First, drop the constraints associated with this key.  */
-        drop_dependent_cons(ctx, key);
+        /* First, check whether a constraint is associated with this key. */
+        if (check_dependent_cons(ctx, key, gbl_ddl_cascade_drop)) {
+            pParse->rc = SQLITE_ERROR;
+            sqlite3ErrorMsg(pParse,
+                            "Key '%s' cannot be dropped as it is being used "
+                            "in a foreign key constraint.",
+                            idx_name);
+            goto cleanup;
+        }
 
         /* Mark the key as deleted. */
         key->flags |= KEY_DELETED;

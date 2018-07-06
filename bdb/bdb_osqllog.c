@@ -35,6 +35,7 @@
 #include <locks.h>
 
 #include <logmsg.h>
+#include <util.h>
 
 #include <build/db.h>
 #include <build/db_int.h>
@@ -71,17 +72,6 @@ static char hex(unsigned char a)
         return '0' + a;
     return 'a' + (a - 10);
 }
-static void hexdumpf(char *key, int keylen, FILE *f)
-{
-    int i = 0;
-
-    for (i = 0; i < keylen; i++) {
-        logmsg(LOGMSG_USER, "%c%c", hex(((unsigned char)key[i]) / 16),
-                hex(((unsigned char)key[i]) % 16));
-    }
-}
-
-static void hexdump(char *key, int keylen) { hexdumpf(key, keylen, stderr); }
 
 /**
  * Contains a copy of one log record
@@ -511,8 +501,11 @@ bdb_osql_updix_rec(llog_undo_upd_ix_args *upd_ix, DB_LSN *lsn, int *bdberr)
     bdb_osql_log_rec_t *rec = (bdb_osql_log_rec_t *)calloc(1, sizeof(*rec));
     unsigned long long genid = upd_ix->oldgenid;
 
-    if (flibc_ntohll(upd_ix->oldgenid) >= flibc_ntohll(upd_ix->newgenid))
+    if (flibc_ntohll(upd_ix->oldgenid) >= flibc_ntohll(upd_ix->newgenid)) {
+        logmsg(LOGMSG_FATAL, "Oldgenid %llx >= negenid %llx\n",
+               flibc_ntohll(upd_ix->oldgenid), flibc_ntohll(upd_ix->newgenid));
         abort();
+    }
 
     /*
     fprintf (stderr, "%s:%d ix old = %llx new=%llx\n",
@@ -788,8 +781,13 @@ bdb_osql_updix_lk_rec(llog_undo_upd_ix_lk_args *upd_ix_lk, DB_LSN *lsn,
     bdb_osql_log_rec_t *rec = (bdb_osql_log_rec_t *)calloc(1, sizeof(*rec));
     unsigned long long genid = upd_ix_lk->oldgenid;
 
-    if (flibc_ntohll(upd_ix_lk->oldgenid) >= flibc_ntohll(upd_ix_lk->newgenid))
+    if (flibc_ntohll(upd_ix_lk->oldgenid) >=
+        flibc_ntohll(upd_ix_lk->newgenid)) {
+        logmsg(LOGMSG_FATAL, "Oldgenid %llx >= negenid %llx\n",
+               flibc_ntohll(upd_ix_lk->oldgenid),
+               flibc_ntohll(upd_ix_lk->newgenid));
         abort();
+    }
 
     if (!rec) {
         *bdberr = BDBERR_MALLOC;
@@ -1390,9 +1388,9 @@ static int bdb_osql_log_apply_ll(bdb_state_type *bdb_state,
                 logmsg(LOGMSG_USER,
                        "INSERTED DT[%d:%d]:\n\tkeylen=%zu\n\tkey=\"",
                        rec->dbnum, tableid, sizeof(genid));
-                hexdump((char *)&genid, sizeof(genid));
+                hexdump(LOGMSG_USER, (char *)&genid, sizeof(genid));
                 logmsg(LOGMSG_USER, "\"\n\tdatalen=%d\n\tdata=\"", dtalen);
-                hexdump(dta, dtalen);
+                hexdump(LOGMSG_USER, dta, dtalen);
                 logmsg(LOGMSG_USER, "\"\n");
             }
 
@@ -1497,9 +1495,9 @@ static int bdb_osql_log_apply_ll(bdb_state_type *bdb_state,
                        rec->dbnum, tableid,
                        (bdb_state->ixdups[tableid]) ? "dupd" : "uniq",
                        newkeylen);
-                hexdump(newkey, newkeylen);
+                hexdump(LOGMSG_USER, newkey, newkeylen);
                 logmsg(LOGMSG_USER, "\"\n\tdatalen=%d\n\tdata=\"", use_datalen);
-                hexdump(use_data, use_datalen);
+                hexdump(LOGMSG_USER, use_data, use_datalen);
                 logmsg(LOGMSG_USER, "\"\n");
             }
 

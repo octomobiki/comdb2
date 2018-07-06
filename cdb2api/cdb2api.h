@@ -34,8 +34,7 @@ enum cdb2_hndl_alloc_flags {
     CDB2_DIRECT_CPU = 4,
     CDB2_RANDOM = 8,
     CDB2_RANDOMROOM = 16,
-    CDB2_ROOM = 32,
-    CDB2_CACHE_SSL_SESSIONS = 64
+    CDB2_ROOM = 32
 };
 
 enum cdb2_request_type {
@@ -78,6 +77,8 @@ enum cdb2_errors {
     CDB2ERR_ACCESS = -106,
 
     CDB2ERR_TRAN_MODE_UNSUPPORTED = -107,
+
+    CDB2ERR_SCHEMA = -110,
 
     CDB2ERR_VERIFY_ERROR = 2,
     CDB2ERR_FKEY_VIOLATION = 3,

@@ -31,11 +31,9 @@ extern int __berkdb_read_alarm_ms;
 #include <sys/statvfs.h>
 
 #include <segstr.h>
-#include <plink.h>
 #include <epochlib.h>
 #include <net.h>
 #include <memory_sync.h>
-#include <plink.h>
 
 #include <bdb_api.h>
 #ifdef _LINUX_SOURCE
@@ -620,6 +618,7 @@ void bdb_newsi_mempool_stat();
 
 void *handle_exit_thd(void *arg) 
 {
+    logmsg(LOGMSG_WARN, "DB requested exit...\n");
     static pthread_mutex_t exiting_lock = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&exiting_lock);
     if( gbl_exit ) {
@@ -690,7 +689,7 @@ int process_command(struct dbenv *dbenv, char *line, int lline, int st)
     }
 
     if (tokcmp(tok, ltok, "exit") == 0) {
-        logmsg(LOGMSG_WARN, "requested exit...\n");
+        logmsg(LOGMSG_USER, "requesting exit...\n");
 
         pthread_t thread_id;
         pthread_attr_t thd_attr;
@@ -1173,7 +1172,8 @@ int process_command(struct dbenv *dbenv, char *line, int lline, int st)
             return -1;
         }
 
-       logmsg(LOGMSG_USER, "will attempt to delete unused files for %s\n", table);
+        logmsg(LOGMSG_USER, "will attempt to delete unused files for %s\n",
+               table);
 
         rc = bdb_del_unused_files(db->handle, &bdberr);
         if (rc != 0) {
@@ -2608,6 +2608,8 @@ int process_command(struct dbenv *dbenv, char *line, int lline, int st)
     } else if (tokcmp(tok, ltok, "scforceabort") == 0) {
         logmsg(LOGMSG_USER, "Forcibly resetting schema change flat\n");
         sc_set_running(NULL, 0, 0, NULL, 0);
+    } else if (tokcmp(tok, ltok, "get_db_dir")==0) {
+        logmsg(LOGMSG_USER, "Database Base Directory: %s\n", thedb->basedir);
     } else if (tokcmp(tok, ltok, "debug") == 0) {
         debug_trap(line + st, lline - st);
     }
@@ -3372,7 +3374,6 @@ int process_command(struct dbenv *dbenv, char *line, int lline, int st)
     } else if (tokcmp(tok, ltok, "help") == 0) {
         tok = segtok(line, lline, &st, &ltok);
         if (ltok == 0) {
-           logmsg(LOGMSG_USER, "%s\n", plink_constant(PLINK_TIME));
             print_help_page(HELP_MAIN);
         } else if (tokcmp(tok, ltok, "java") == 0) {
             print_help_page(HELP_JAVA);
@@ -4018,12 +4019,7 @@ int process_command(struct dbenv *dbenv, char *line, int lline, int st)
         logmsg(LOGMSG_ERROR, "Usage: testrep num_items item_size\n");
     } else if (tokcmp(tok, ltok, "random_lock_release_interval") == 0) {
         int tmp;
-        tok = segtok(line, sizeof(line), &st, &ltok);
-
-        if (ltok <= 0) {
-            logmsg(LOGMSG_ERROR, "Expected value for random_release_locks_interval\n");
-            return 0;
-        }
+        tok = segtok(line, lline, &st, &ltok);
 
         tmp = toknum(tok, ltok);
         if (tmp >= 0) {

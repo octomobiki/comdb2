@@ -107,8 +107,6 @@ struct blocksql_tran {
 };
 
 typedef struct oplog_key {
-    unsigned long long rqid;
-    uuid_t uuid;
     unsigned long long seq;
 } oplog_key_t;
 
@@ -120,7 +118,6 @@ static int apply_changes(struct ireq *iq, blocksql_tran_t *tran, void *iq_tran,
                                      struct block_err *, int *, SBUF2 *));
 static int osql_bplog_wait(blocksql_tran_t *tran);
 static int req2blockop(int reqtype);
-static int osql_bplog_loginfo(struct ireq *iq, osql_sess_t *sess);
 
 /**
  * The bplog key-compare function - required because memcmp changes
@@ -143,18 +140,6 @@ static int osql_bplog_key_cmp(void *usermem, int key1len, const void *key1,
     oplog_key_t *k2 = (oplog_key_t *)key2;
 #endif
     int cmp;
-
-    if (k1->rqid < k2->rqid) {
-        return -1;
-    }
-
-    if (k1->rqid > k2->rqid) {
-        return 1;
-    }
-
-    cmp = comdb2uuidcmp(k1->uuid, k2->uuid);
-    if (cmp)
-        return cmp;
 
     if (k1->seq < k2->seq) {
         return -1;
@@ -241,10 +226,8 @@ int osql_bplog_start(struct ireq *iq, osql_sess_t *sess)
     return 0;
 }
 
-/**
- *
- *
- */
+/* Wait for pending sessions to finish;
+   If any request has failed because of deadlock, repeat */
 int osql_bplog_finish_sql(struct ireq *iq, struct block_err *err)
 {
     blocksql_tran_t *tran = (blocksql_tran_t *)iq->blocksql_tran;
@@ -254,9 +237,6 @@ int osql_bplog_finish_sql(struct ireq *iq, struct block_err *err)
     int rc = 0, irc = 0;
     int stop_time = 0;
 
-    /* wait for pending sessions to finish;
-       if any request has failed because of deadlock, repeat
-     */
     while (tran->pending.top && !error) {
 
         /* go through the list of pending requests and if there are any
@@ -291,16 +271,6 @@ int osql_bplog_finish_sql(struct ireq *iq, struct block_err *err)
                 break;
 
             case SESS_DONE_ERROR:
-
-                /* TOOBIG magic */
-                if ((xerr->errval == ERR_TRAN_TOO_BIG || xerr->errval == 4)) {
-                    irc = osql_bplog_loginfo(iq, info->sess);
-                    if (irc) {
-                        logmsg(LOGMSG_ERROR, "%s: failed to log the bplog rc=%d\n",
-                                __func__, irc);
-                    }
-                }
-
                 error = 1;
                 break;
 
@@ -364,6 +334,8 @@ int osql_bplog_finish_sql(struct ireq *iq, struct block_err *err)
     return 0;
 }
 
+int sc_set_running(char *table, int running, uint64_t seed, const char *host,
+                   time_t time);
 /**
  * Apply all schema changes and wait for them to finish
  */
@@ -396,13 +368,12 @@ int osql_bplog_schemachange(struct ireq *iq)
             sc->sc_next = iq->sc_pending;
             iq->sc_pending = sc;
         } else if (sc->sc_rc == SC_MASTER_DOWNGRADE) {
+            sc_set_running(sc->table, 0, iq->sc_seed, NULL, 0);
             free_schema_change_type(sc);
             rc = ERR_NOMASTER;
         } else {
-            free_schema_change_type(sc);
-            int sc_set_running(char *table, int running, uint64_t seed,
-                               const char *host, time_t time);
             sc_set_running(sc->table, 0, iq->sc_seed, NULL, 0);
+            free_schema_change_type(sc);
             if (sc->sc_rc)
                 rc = ERR_SC;
         }
@@ -654,7 +625,7 @@ const char *osql_reqtype_str(int type)
  */
 int osql_bplog_saveop(osql_sess_t *sess, char *rpl, int rplen,
                       unsigned long long rqid, uuid_t uuid,
-                      unsigned long long seq, char *host)
+                      unsigned long long seq, const char *host)
 {
     blocksql_tran_t *tran = (blocksql_tran_t *)osql_sess_getbptran(sess);
     if (!tran || !tran->db) {
@@ -683,9 +654,8 @@ int osql_bplog_saveop(osql_sess_t *sess, char *rpl, int rplen,
            rqid, type, osql_reqtype_str(type), osql_log_time(), seq);
 #endif
 
-    key.rqid = rqid;
     key.seq = seq;
-    comdb2uuidcpy(key.uuid, uuid);
+    assert (sess->rqid == rqid);
 
     /* add the op into the temporary table */
     if ((rc = pthread_mutex_lock(&tran->store_mtx))) {
@@ -726,15 +696,14 @@ int osql_bplog_saveop(osql_sess_t *sess, char *rpl, int rplen,
     }
 
 #if 0 
-   printf("%s: rqid=%llx Saving op type=%d\n", __func__, key.rqid, ntohl(*((int*)rpl)));
+   printf("%s: rqid=%llx Saving op type=%d\n", __func__, rqid, ntohl(*((int*)rpl)));
 #endif
 
     rc_op = bdb_temp_table_put(thedb->bdb_env, tran->db, &key, sizeof(key), rpl,
                                rplen, NULL, &bdberr);
     if (rc_op) {
-        logmsg(LOGMSG_ERROR, 
-            "%s: fail to put oplog rqid=%llx (%lld) seq=%llu rc=%d bdberr=%d\n",
-            __func__, key.rqid, key.rqid, key.seq, rc, bdberr);
+        logmsg(LOGMSG_ERROR, "%s: fail to put oplog seq=%llu rc=%d bdberr=%d\n",
+               __func__, key.seq, rc_op, bdberr);
     } else if (gbl_osqlpfault_threads) {
         osql_page_prefault(rpl, rplen, &(tran->last_db),
                            &(osql_session_get_ireq(sess)->osql_step_ix), rqid,
@@ -1103,7 +1072,6 @@ static int process_this_session(
 
     blocksql_tran_t *tran = (blocksql_tran_t *)iq->blocksql_tran;
     unsigned long long rqid = osql_sess_getrqid(sess);
-    oplog_key_t *key = NULL;
     oplog_key_t key_next, key_crt;
     char *data = NULL;
     int datalen = 0;
@@ -1122,35 +1090,23 @@ static int process_this_session(
 
     iq->queryid = osql_sess_queryid(sess);
 
-    key = (oplog_key_t *)malloc(sizeof(oplog_key_t));
-    if (!key) {
-        logmsg(LOGMSG_ERROR, "%s: unable to allocated %zu bytes\n", __func__,
-               sizeof(oplog_key_t));
-        return -1;
-    }
-
-    key->rqid = rqid;
-    key->seq = 0;
-    osql_sess_getuuid(sess, key->uuid);
     osql_sess_getuuid(sess, uuid);
-    key_next = key_crt = *key;
 
-    if (key->rqid != OSQL_RQID_USE_UUID)
-        reqlog_set_rqid(iq->reqlogger, &key->rqid, sizeof(unsigned long long));
+    if (rqid != OSQL_RQID_USE_UUID)
+        reqlog_set_rqid(iq->reqlogger, &rqid, sizeof(unsigned long long));
     else
         reqlog_set_rqid(iq->reqlogger, uuid, sizeof(uuid));
     reqlog_set_event(iq->reqlogger, "txn");
 
     /* go through each record */
-    rc = bdb_temp_table_find_exact(thedb->bdb_env, dbc, key, sizeof(*key),
-                                   bdberr);
-    if(rc != IX_FND)
-        free(key);
+    rc = bdb_temp_table_first(thedb->bdb_env, dbc, bdberr);
     if (rc && rc != IX_EMPTY && rc != IX_NOTFND) {
+        reqlog_set_error(iq->reqlogger, "bdb_temp_table_first failed", rc);
         logmsg(LOGMSG_ERROR, "%s: bdb_temp_table_first failed rc=%d bdberr=%d\n",
                 __func__, rc, *bdberr);
         return rc;
     }
+    key_next = key_crt = *(oplog_key_t *)bdb_temp_table_key(dbc);
 
     if (rc == IX_NOTFND) {
         comdb2uuidstr(uuid, us);
@@ -1169,6 +1125,7 @@ static int process_this_session(
             err->blockop_num = 0;
             err->errcode = ERR_NOMASTER;
             err->ixnum = 0;
+            reqlog_set_error(iq->reqlogger, "ERR_NOMASTER", ERR_NOMASTER);
             return ERR_NOMASTER /*OSQL_FAILDISPATCH*/;
         }
 
@@ -1182,6 +1139,7 @@ static int process_this_session(
                       blobs, step, err, &receivedrows, logsb);
 
         if (rc_out != 0 && rc_out != OSQL_RC_DONE) {
+            reqlog_set_error(iq->reqlogger, "Error processing", rc_out);
             /* error processing, can be a verify error or deadlock */
             break;
         }
@@ -1196,22 +1154,6 @@ static int process_this_session(
         if (!rc) {
             /* are we still on the same rqid */
             key_next = *(oplog_key_t *)bdb_temp_table_key(dbc);
-            if (key_next.rqid != key_crt.rqid) {
-                /* done with the current transaction*/
-                break;
-            }
-            if (key_crt.rqid == OSQL_RQID_USE_UUID) {
-                if (comdb2uuidcmp(key_crt.uuid, key_next.uuid)) {
-                    /* done with the current transaction*/
-                    break;
-                }
-            } else {
-                if (key_next.rqid != key_crt.rqid) {
-                    /* done with the current transaction*/
-                    break;
-                }
-            }
-
             /* check correct sequence; this is an attempt to
                catch dropped packets - not that we would do that purposely */
             if (key_next.seq != key_crt.seq + 1) {
@@ -1233,9 +1175,8 @@ static int process_this_session(
     if (updCols)
         free(updCols);
 
-    if (rc == 0 || rc == IX_PASTEOF || rc == IX_EMPTY) {
-        rc = 0;
-    } else {
+    if (rc != 0 && rc != IX_PASTEOF && rc != IX_EMPTY) {
+        reqlog_set_error(iq->reqlogger, "Internal Error", rc);
         logmsg(LOGMSG_ERROR, "%s:%d bdb_temp_table_next failed rc=%d bdberr=%d\n",
                 __func__, __LINE__, rc, *bdberr);
         rc_out = ERR_INTERNAL;
@@ -1488,71 +1429,6 @@ void osql_bplog_time_done(struct ireq *iq)
         }
     }
     logmsg(LOGMSG_USER, "%s]\n", msg);
-}
-
-static int osql_bplog_loginfo(struct ireq *iq, osql_sess_t *sess)
-{
-    blocksql_tran_t *tran = (blocksql_tran_t *)iq->blocksql_tran;
-    struct temp_cursor *dbc = NULL;
-    blob_buffer_t blobs[MAXBLOBS];
-    SBUF2 *logsb = NULL;
-    int bdberr = 0;
-    int nops = 0;
-    struct block_err err;
-    int rc = 0, outrc = 0;
-    char filename[PATH_MAX];
-    int counter = 0;
-    int fd = 0;
-    pthread_mutex_t bplog_ctr_mtx = PTHREAD_MUTEX_INITIALIZER;
-    static int bplog_ctr = 0; /* 256 files only */
-    unsigned long long rqid;
-    uuid_t uuid;
-
-    rqid = osql_sess_getrqid(sess);
-    osql_sess_getuuid(sess, uuid);
-
-    pthread_mutex_lock(&bplog_ctr_mtx);
-    counter = (bplog_ctr++) % 256;
-    pthread_mutex_unlock(&bplog_ctr_mtx);
-
-    /* open the sbuf2 */
-    snprintf(filename, sizeof(filename), "%s/%s_toobig.log.%d", thedb->basedir,
-             thedb->envname, counter);
-
-    fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0) {
-        logmsg(LOGMSG_ERROR, "%s: failed to open %s\n", __func__, filename);
-        return -1;
-    }
-
-    logsb = sbuf2open(fd, 0);
-    if (!logsb) {
-        logmsg(LOGMSG_ERROR, "%s sbuf2open failed\n", __func__);
-        close(fd);
-        return -1;
-    }
-
-    /* create a cursor */
-    dbc = bdb_temp_table_cursor(thedb->bdb_env, tran->db, NULL, &bdberr);
-    if (!dbc || bdberr) {
-        logmsg(LOGMSG_ERROR, "%s: failed to create cursor bdberr = %d\n", __func__,
-                bdberr);
-        return ERR_INTERNAL;
-    }
-
-    outrc = process_this_session(iq, NULL, sess, &bdberr, &nops, &err, logsb,
-                                 dbc, osql_log_packet);
-
-    /* close the cursor */
-    rc = bdb_temp_table_close_cursor(thedb->bdb_env, dbc, &bdberr);
-    if (rc != 0) {
-        logmsg(LOGMSG_ERROR, "%s: failed close cursor rc=%d bdberr=%d\n", __func__,
-                rc, bdberr);
-    }
-
-    sbuf2close(logsb);
-
-    return outrc;
 }
 
 void osql_set_delayed(struct ireq *iq)

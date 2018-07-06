@@ -36,6 +36,7 @@
 
 #include "fwd_types.h"
 #include "bdb_net.h"
+
 #include <assert.h>
 /*#include "protobuf/sqlresponse.pb-c.h"*/
 
@@ -637,6 +638,7 @@ void bdb_set_tran_lockerid(tran_type *tran, uint32_t lockerid);
 void bdb_get_tran_lockerid(tran_type *tran, uint32_t *lockerid);
 void *bdb_get_physical_tran(tran_type *ltran);
 void bdb_ltran_get_schema_lock(tran_type *ltran);
+void bdb_ltran_put_schema_lock(tran_type *ltran);
 
 tran_type *bdb_tran_begin_socksql(bdb_state_type *, int trak, int *bdberr);
 
@@ -645,10 +647,10 @@ tran_type *bdb_tran_begin_readcommitted(bdb_state_type *, int trak,
 
 tran_type *bdb_tran_begin_serializable(bdb_state_type *bdb_state, int trak,
                                        int *bdberr, int epoch, int file,
-                                       int offset);
+                                       int offset, int is_ha_retry);
 tran_type *bdb_tran_begin_snapisol(bdb_state_type *bdb_state, int trak,
-                                   int *bdberr, int epoch, int file,
-                                   int offset);
+                                   int *bdberr, int epoch, int file, int offset,
+                                   int is_ha_retry);
 
 /* commit the transaction referenced by the tran handle */
 int bdb_tran_commit(bdb_state_type *bdb_handle, tran_type *tran, int *bdberr);
@@ -732,11 +734,11 @@ int bdb_prim_addkey_genid(bdb_state_type *bdb_handle, tran_type *tran,
                           int isnull, int *bdberr);
 int bdb_prim_delkey_genid(bdb_state_type *bdb_handle, tran_type *tran,
                           void *ixdta, int ixnum, int rrn,
-                          unsigned long long genid, int *bdberr);
+                          unsigned long long genid, int isnull, int *bdberr);
 int bdb_prim_updkey_genid(bdb_state_type *bdb_state, tran_type *tran, void *key,
                           int keylen, int ixnum, unsigned long long oldgenid,
                           unsigned long long genid, void *dta, int dtalen,
-                          int *bdberr);
+                          int isnull, int *bdberr);
 
 int bdb_prim_upgrade(bdb_state_type *bdb_state, tran_type *tran, void *newdta,
                      int newdtaln, unsigned long long oldgenid, int *bdberr);
@@ -850,6 +852,9 @@ int bdb_lite_fetch_keys_bwd_tran(bdb_state_type *bdb_state, tran_type *tran,
                                  int *numfnd, int *bdberr);
 int bdb_lite_fetch_partial(bdb_state_type *bdb_state, void *key_in, int klen_in,
                            void *key_out, int *fnd, int *bdberr);
+int bdb_lite_fetch_partial_tran(bdb_state_type *bdb_state, tran_type *tran,
+                                void *key_in, int klen_in, void *key_out,
+                                int *fnd, int *bdberr);
 
 /* queue operations are for queue tables - fifos with multiple consumers */
 
@@ -977,7 +982,7 @@ int bdb_amimaster(bdb_state_type *bdb_handle);
 char *bdb_whoismaster(bdb_state_type *bdb_handle);
 
 int bdb_get_rep_master(bdb_state_type *bdb_state, char **master_out,
-                       uint32_t *egen);
+                       uint32_t *gen, uint32_t *egen);
 
 /* get current sanc list.  pass in size of array.  returns number of sanc
  * nodes (may be > passed in list length). */
@@ -1047,6 +1052,8 @@ int bdb_purge_freelist(bdb_state_type *bdb_handle, int *bdberr);
 /* close the underlying files used byt the bdb_handle */
 int bdb_close_only(bdb_state_type *bdb_handle, int *bdberr);
 
+int bdb_close_only_sc(bdb_state_type *bdb_handle, tran_type *tran, int *bdberr);
+
 /* you must call bdb_close_only before a rename.
    if you want to rename a file that is in use and continue to use it, you
    need to:
@@ -1095,6 +1102,7 @@ int bdb_del_unused_files_tran(bdb_state_type *bdb_state, tran_type *tran,
 int bdb_list_unused_files(bdb_state_type *bdb_state, int *bdberr, char *powner);
 int bdb_list_unused_files_tran(bdb_state_type *bdb_state, tran_type *tran,
                                int *bdberr, char *powner);
+int bdb_list_dropped_files(bdb_state_type *bdb_state, int *bdberr);
 
 /* make new stripes */
 int bdb_create_stripes(bdb_state_type *bdb_state, int newdtastripe,
@@ -1399,6 +1407,14 @@ int bdb_get_file_version_table(bdb_state_type *bdb_state, tran_type *tran,
                                unsigned long long *version_num, int *bdberr);
 int bdb_get_file_version_qdb(bdb_state_type *, tran_type *,
                              unsigned long long *version, int *bdberr);
+int bdb_get_file_version_data_by_name(tran_type *tran, const char *name,
+                                      int file_num,
+                                      unsigned long long *version_num,
+                                      int *bdberr);
+int bdb_get_file_version_index_by_name(tran_type *tran, const char *name,
+                                       int file_num,
+                                       unsigned long long *version_num,
+                                       int *bdberr);
 
 int bdb_del_file_versions(bdb_state_type *bdb_state, tran_type *input_trans,
                           int *bdberr);
@@ -1452,7 +1468,8 @@ int bdb_del_list_free(void *list, int *bdberr);
 int bdb_set_in_schema_change(tran_type *input_trans, const char *db_name,
                              void *schema_change_data,
                              size_t schema_change_data_len, int *bdberr);
-int bdb_get_in_schema_change(const char *db_name, void **schema_change_data,
+int bdb_get_in_schema_change(tran_type *input_trans, const char *db_name,
+                             void **schema_change_data,
                              size_t *schema_change_data_len, int *bdberr);
 
 int bdb_set_high_genid(tran_type *input_trans, const char *db_name,
@@ -1609,7 +1626,7 @@ int bdb_user_password_delete(tran_type *tran, char *user);
 int bdb_user_get_all(char ***users, int *num);
 
 int bdb_verify(
-    SBUF2 *sb, bdb_state_type *bdb_state,
+    SBUF2 *sb, bdb_state_type *bdb_state, void *db_table,
     int (*formkey_callback)(void *parm, void *dta, void *blob_parm, int ix,
                             void *keyout, int *keysz),
     int (*get_blob_sizes_callback)(void *parm, void *dta, int blobs[16],
@@ -1710,6 +1727,7 @@ extern struct thdpool *gbl_pgcompact_thdpool;
 int pgcompact_thdpool_init(void);
 
 int get_dbnum_by_handle(bdb_state_type *bdb_state);
+int get_dbnum_by_name(bdb_state_type *bdb_state, const char *name);
 int send_myseqnum_to_master(bdb_state_type *, int nodelay);
 
 const char *bdb_temp_table_filename(struct temp_table *);
@@ -1937,7 +1955,6 @@ void lock_info_lockers(FILE *out, bdb_state_type *bdb_state);
 
 const char *bdb_find_net_host(bdb_state_type *bdb_state, const char *host);
 
-unsigned long long get_next_sc_seed(bdb_state_type *bdb_state);
 unsigned long long bdb_get_a_genid(bdb_state_type *bdb_state);
 
 /* Return the timestamp of the replicants coherency lease */
@@ -1981,6 +1998,7 @@ int bdb_next_user_get(bdb_state_type *bdb_state, tran_type *tran, char *key,
                       char *user_out, int *isop, int *bdberr);
 int bdb_latest_commit_is_durable(void *bdb_state);
 int bdb_is_standalone(void *dbenv, void *in_bdb_state);
+int bdb_valid_lease(void *bdb_state);
 
 uint32_t bdb_get_rep_gen(bdb_state_type *bdb_state);
 
@@ -2001,5 +2019,21 @@ void rename_bdb_state(bdb_state_type *bdb_state, const char *newname);
 
 int request_durable_lsn_from_master(bdb_state_type *, uint32_t *, uint32_t *,
                                     uint32_t *);
+
+int bdb_process_each_table_version_entry(bdb_state_type *bdb_state,
+                                         int (*func)(bdb_state_type *bdb_state,
+                                                     const char *tblname,
+                                                     int *bdberr),
+                                         int *bdberr);
+
+int bdb_process_each_table_dta_entry(bdb_state_type *bdb_state, tran_type *tran,
+                                     const char *tblname,
+                                     unsigned long long version, int *bdberr);
+int bdb_process_each_table_idx_entry(bdb_state_type *bdb_state, tran_type *tran,
+                                     const char *tblname,
+                                     unsigned long long version, int *bdberr);
+
+int bdb_check_files_on_disk(bdb_state_type *bdb_state, const char *tblname,
+                            int *bdberr);
 
 #endif

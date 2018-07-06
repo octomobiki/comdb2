@@ -27,6 +27,7 @@
 #include "views.h"
 #include "logmsg.h"
 #include "bdb_net.h"
+#include "comdb2_atomic.h"
 
 static int reload_rename_table(bdb_state_type *bdb_state, const char *name,
                                const char *newtable)
@@ -156,9 +157,10 @@ int live_sc_post_del_record(struct ireq *iq, void *trans,
                "Aborting schema change due to unexpected error\n");
         usedb->sc_abort = 1;
         MEMORY_SYNC;
-    } else if (rc == 0) {
-        (iq->sc_deletes)++;
+        rc = 0; // should just fail SC
     }
+
+    ATOMIC_ADD(usedb->sc_deletes, 1);
     if (iq->debug) {
         reqpopprefixes(iq, 1);
     }
@@ -223,9 +225,13 @@ int live_sc_post_update_delayed_key_adds_int(struct ireq *iq, void *trans,
     blob_buffer_t *add_idx_blobs = NULL;
     int rc = 0;
 
+    if (usedb->sc_downgrading)
+        return ERR_NOMASTER;
+
     if (usedb->sc_from != iq->usedb) {
         return 0;
     }
+
 #ifdef DEBUG_SC
     printf("live_sc_post_update_delayed_key_adds_int: looking at genid %llx\n",
            newgenid);
@@ -280,7 +286,7 @@ int live_sc_post_update_delayed_key_adds_int(struct ireq *iq, void *trans,
         MEMORY_SYNC;
         free(new_dta);
         free_blob_status_data(oldblobs);
-        return rc;
+        return 0; // should just fail SC
     }
 
     ins_keys = revalidate_new_indexes(iq, usedb->sc_to, new_dta, add_idx_blobs,
@@ -307,6 +313,7 @@ int live_sc_post_update_delayed_key_adds_int(struct ireq *iq, void *trans,
                "Aborting schema change due to unexpected error\n");
         iq->usedb->sc_abort = 1;
         MEMORY_SYNC;
+        rc = 0; // should just fail SC
     }
     if (iq->debug) {
         reqpopprefixes(iq, 1);
@@ -348,8 +355,8 @@ int live_sc_post_add_record(struct ireq *iq, void *trans,
     if (rc) {
         usedb->sc_abort = 1;
         MEMORY_SYNC;
-        free(new_dta);
-        return rc;
+        rc = 0;
+        goto done; // should just fail SC
     }
 
     ins_keys =
@@ -373,8 +380,8 @@ int live_sc_post_add_record(struct ireq *iq, void *trans,
 
             usedb->sc_abort = 1;
             MEMORY_SYNC;
-            free(new_dta);
-            return 0;
+            rc = 0;
+            goto done; // should just fail SC
         }
     }
 
@@ -408,13 +415,15 @@ int live_sc_post_add_record(struct ireq *iq, void *trans,
                "Aborting schema change due to unexpected error\n");
         iq->usedb->sc_abort = 1;
         MEMORY_SYNC;
+        rc = 0; // should just fail SC
     }
 
+done:
     if (iq->debug) {
         reqpopprefixes(iq, 1);
     }
 
-    iq->sc_adds++;
+    ATOMIC_ADD(usedb->sc_adds, 1);
     free(new_dta);
     return rc;
 }
@@ -459,9 +468,10 @@ int live_sc_post_upd_record(struct ireq *iq, void *trans,
                "Aborting schema change due to unexpected error\n");
         iq->usedb->sc_abort = 1;
         MEMORY_SYNC;
-    } else if (rc == 0) {
-        (iq->sc_updates)++;
+        rc = 0; // should just fail SC
     }
+
+    ATOMIC_ADD(usedb->sc_updates, 1);
     if (iq->debug) {
         reqpopprefixes(iq, 1);
     }
@@ -492,6 +502,9 @@ void sc_del_unused_files_tran(struct dbtable *db, tran_type *tran)
 {
     int bdberr;
 
+    if (db == NULL)
+        return;
+
     pthread_mutex_lock(&gbl_sc_lock);
     sc_del_unused_files_start_ms = comdb2_time_epochms();
     pthread_mutex_unlock(&gbl_sc_lock);
@@ -500,7 +513,7 @@ void sc_del_unused_files_tran(struct dbtable *db, tran_type *tran)
         if (bdb_list_unused_files_tran(db->handle, tran, &bdberr,
                                        "schemachange") ||
             bdberr != BDBERR_NOERROR)
-            logmsg(LOGMSG_WARN, "errors listing old files\n");
+            logmsg(LOGMSG_WARN, "%s: errors listing old files\n", __func__);
     } else {
         if (bdb_del_unused_files_tran(db->handle, tran, &bdberr) ||
             bdberr != BDBERR_NOERROR)
@@ -545,9 +558,8 @@ void sc_del_unused_files_check_progress(void)
 
 static int delete_table_rep(char *table, void *tran)
 {
-    struct dbtable *db;
     int rc, bdberr;
-    db = get_dbtable_by_name(table);
+    struct dbtable *db = get_dbtable_by_name(table);
     if (db == NULL) {
         logmsg(LOGMSG_ERROR, "delete_table_rep : invalid table %s\n", table);
         return -1;
@@ -555,7 +567,7 @@ static int delete_table_rep(char *table, void *tran)
 
     remove_constraint_pointers(db);
 
-    if ((rc = bdb_close_only(db->handle, &bdberr))) {
+    if ((rc = bdb_close_only_sc(db->handle, tran, &bdberr))) {
         logmsg(LOGMSG_ERROR, "bdb_close_only rc %d bdberr %d\n", rc, bdberr);
         return -1;
     }
@@ -688,6 +700,8 @@ int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
         add_new_db = (db == NULL);
     }
 
+    assert(type != add || add_new_db == 1);
+
     if (type == setcompr) {
         logmsg(LOGMSG_INFO,
                "Replicant setting compression flags for table:%s\n", table);
@@ -707,20 +721,12 @@ int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
                    __func__, table);
             exit(1);
         }
-        if (create_sqlmaster_records(tran)) {
-            logmsg(LOGMSG_FATAL,
-                   "create_sqlmaster_records: error creating sqlite "
-                   "master records for %s.\n",
-                   table);
-            exit(1);
-        }
-        create_sqlite_master();
-        ++gbl_dbopen_gen;
-        goto done;
     } else if (type == bulkimport) {
         logmsg(LOGMSG_INFO, "Replicant bulkimporting table:%s\n", table);
         reload_after_bulkimport(db, tran);
     } else {
+        assert(type == alter || type == fastinit);
+
         logmsg(LOGMSG_INFO, "Replicant %s table:%s\n",
                type == alter ? "altering" : "fastinit-ing", table);
         extern int gbl_broken_max_rec_sz;
@@ -734,15 +740,6 @@ int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
         }
         gbl_broken_max_rec_sz = saved_broken_max_rec_sz;
 
-        if (create_sqlmaster_records(tran)) {
-            logmsg(LOGMSG_FATAL,
-                   "create_sqlmaster_records: error creating sqlite "
-                   "master records for %s.\n",
-                   table);
-            exit(1);
-        }
-        create_sqlite_master(); /* create sql statements */
-
         /* update the delayed deleted files */
         assert(db && !add_new_db);
         rc = bdb_list_unused_files_tran(db->handle, tran, &bdberr,
@@ -751,6 +748,20 @@ int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
             logmsg(LOGMSG_ERROR, "bdb_list_unused_files rc %d bdberr %d\n", rc,
                    bdberr);
         }
+    }
+
+    if (type == add || type == drop || type == alter || type == fastinit) {
+        if (create_sqlmaster_records(tran)) {
+            logmsg(LOGMSG_FATAL,
+                   "create_sqlmaster_records: error creating sqlite "
+                   "master records for %s.\n",
+                   table);
+            exit(1);
+        }
+        create_sqlite_master(); /* create sql statements */
+        ++gbl_dbopen_gen;
+        if (type == drop)
+            goto done;
     }
 
     free(table_copy);
@@ -792,7 +803,6 @@ int scdone_callback(bdb_state_type *bdb_state, const char table[], void *arg,
         add_tag_schema(db->tablename, ver_one);
     }
 
-    ++gbl_dbopen_gen;
     llmeta_dump_mapping_tran(tran, thedb);
     llmeta_dump_mapping_table_tran(tran, thedb, table, 1);
 
@@ -825,18 +835,4 @@ done:
 
     sc_set_running((char *)table, 0 /*running*/, 0 /*seed*/, NULL, 0);
     return rc; /* success */
-}
-
-void getMachineAndTimeFromFstSeed(uint64_t seed, uint32_t host,
-                                  const char **mach, time_t *timet)
-{
-    /* fastseeds are formed from an epoch time, machine number and
-     * duplication factor, so we can decode the fastseed to get the
-     * master machine that started the schema change and the time at which
-     * it was done. */
-    unsigned int *iptr = (unsigned int *)&seed;
-
-    *mach = get_hostname_with_crc32(thedb->bdb_env, host);
-    *timet = ntohl(iptr[0]);
-    return;
 }

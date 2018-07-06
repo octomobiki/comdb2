@@ -115,6 +115,8 @@ __txn_regop_gen_recover(dbenv, dbtp, lsnp, op, info)
 		MUTEX_LOCK(dbenv, db_rep->rep_mutexp);
 		rep->committed_gen = argp->generation;
         rep->committed_lsn = *lsnp;
+        if (argp->generation > rep->gen)
+            __rep_set_gen(dbenv, __func__, __LINE__, argp->generation);
 		MUTEX_UNLOCK(dbenv, db_rep->rep_mutexp);
 	} else if ((dbenv->tx_timestamp != 0 &&
 		argp->timestamp > (int32_t) dbenv->tx_timestamp) ||
@@ -190,6 +192,7 @@ __txn_regop_recover(dbenv, dbtp, lsnp, op, info)
 {
 	DB_TXNHEAD *headp;
 	__txn_regop_args *argp;
+	unsigned long long context = 0;
 	int ret;
 
 #ifdef DEBUG_RECOVER
@@ -252,8 +255,11 @@ __txn_regop_recover(dbenv, dbtp, lsnp, op, info)
 		/* else ret = 0; Not necessary because TXN_OK == 0 */
 	}
 
-	if (ret == 0)
+	if (ret == 0) {
+		if ((context = __txn_regop_read_context(argp)) != 0)
+			set_commit_context(context, NULL, lsnp, argp, DB___txn_regop);
 		*lsnp = argp->prev_lsn;
+	}
 
 	if (0) {
 err:		__db_err(dbenv,
@@ -396,6 +402,8 @@ __txn_regop_rowlocks_recover(dbenv, dbtp, lsnp, op, info)
 		MUTEX_LOCK(dbenv, db_rep->rep_mutexp);
 		rep->committed_gen = argp->generation;
         rep->committed_lsn = *lsnp;
+        if (argp->generation > rep->gen)
+            __rep_set_gen(dbenv, __func__, __LINE__, argp->generation);
 		MUTEX_UNLOCK(dbenv, db_rep->rep_mutexp);
 	} 
 	else if ((dbenv->tx_timestamp != 0 &&

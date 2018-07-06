@@ -578,9 +578,8 @@ static void *thd_req(void *vthd)
 #endif
             pool_relablk(p_reqs, thd->iq); /* this request is done, so release
                                             * resource. */
-            nxtrq =
-                (struct dbq_entry_t *)listc_rtl(&q_reqs); /* get next item off
-                                                         *  hqueue */
+            /* get next item off hqueue */
+            nxtrq = (struct dbq_entry_t *)listc_rtl(&q_reqs);
             thd->iq = 0;
             if (nxtrq != 0) {
                 thd->iq = nxtrq->obj;
@@ -828,10 +827,11 @@ int handled_queue;
 
 int q_reqs_len(void) { return q_reqs.count; }
 
-int init_ireq(struct dbenv *dbenv, struct ireq *iq, SBUF2 *sb, uint8_t *p_buf,
-              const uint8_t *p_buf_end, int debug, char *frommach, int frompid,
-              char *fromtask, int qtype, void *data_hndl, int luxref,
-              unsigned long long rqid, void *p_sinfo, intptr_t curswap)
+static int init_ireq(struct dbenv *dbenv, struct ireq *iq, SBUF2 *sb,
+                     uint8_t *p_buf, const uint8_t *p_buf_end, int debug,
+                     char *frommach, int frompid, char *fromtask, int qtype,
+                     void *data_hndl, int luxref, unsigned long long rqid,
+                     void *p_sinfo, intptr_t curswap)
 {
     struct req_hdr hdr;
     uint64_t nowus;
